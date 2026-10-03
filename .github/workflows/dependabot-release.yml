@@ -18,8 +18,20 @@ jobs:
         uses: dependabot/fetch-metadata@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
+      # main is deliberately not protected (the release job below must push to it),
+      # so wait for the CI "check" job here instead of using --auto.
       - if: steps.meta.outputs.update-type != 'version-update:semver-major'
-        run: gh pr merge --auto --squash "$PR_URL"
+        run: |
+          for i in $(seq 1 60); do
+            state=$(gh pr view "$PR_URL" --json statusCheckRollup \
+              --jq '[.statusCheckRollup[] | select(.name == "check") | .conclusion // .status] | first // "MISSING"')
+            case "$state" in
+              SUCCESS) gh pr merge --squash "$PR_URL"; exit 0 ;;
+              FAILURE|CANCELLED|TIMED_OUT) echo "CI check is $state, not merging."; exit 1 ;;
+            esac
+            sleep 20
+          done
+          echo "Timed out waiting for the CI check."; exit 1
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
