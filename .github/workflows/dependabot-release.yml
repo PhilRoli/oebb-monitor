@@ -1,0 +1,94 @@
+name: Dependabot auto-merge and release
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]' && github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # A merged Dependabot PR that changed Cargo.toml/Cargo.lock ships a new version:
+  # major dependency bump -> 0.X+1.0, anything else -> 0.x.Y+1. Tags pushed with
+  # GITHUB_TOKEN don't start other workflows, so the release workflow is dispatched.
+  release:
+    if: >-
+      github.event.action == 'closed' && github.event.pull_request.merged == true
+      && github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Decide on a release
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+        run: |
+          if ! gh pr diff "$PR_NUMBER" --name-only | grep -qE '^Cargo\.(toml|lock)$'; then
+            echo "No Cargo changes in this PR, nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          current=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          IFS=. read -r major minor patch <<< "$current"
+          if [ "$UPDATE_TYPE" = "version-update:semver-major" ]; then
+            minor=$((minor + 1)); patch=0
+          else
+            patch=$((patch + 1))
+          fi
+          next="$major.$minor.$patch"
+          if git ls-remote --exit-code --tags origin "v$next" >/dev/null 2>&1; then
+            echo "Tag v$next already exists, not releasing." >&2
+            exit 1
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+          echo "Releasing $current -> $next ($UPDATE_TYPE)"
+
+      - name: Bump version, tag and push
+        if: steps.plan.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          sed -i -E '0,/^version = "[^"]*"/s//version = "'"$VERSION"'"/' Cargo.toml
+          cargo update --workspace
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: release v$VERSION"
+          git tag -a "v$VERSION" -m "oebb-monitor v$VERSION"
+          git push --atomic origin main "v$VERSION"
+
+      - name: Start the release build
+        if: steps.plan.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "v$VERSION"

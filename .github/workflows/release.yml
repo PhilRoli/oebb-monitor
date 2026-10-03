@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v[0-9]*'
+  workflow_dispatch: # started by dependabot-release.yml, run on the tag ref
 
 env:
   CARGO_TERM_COLOR: always
