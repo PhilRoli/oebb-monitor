@@ -13,7 +13,7 @@ brew install oebb-monitor
 
 ### Build from source
 
-Requires Rust 1.80+:
+Requires Rust 1.88+:
 
 ```bash
 git clone https://github.com/philroli/oebb-monitor
@@ -26,7 +26,7 @@ cargo install --path .
 ```bash
 oebb-monitor            # start at Wien Westbahnhof (default)
 oebb-monitor --version  # print version
-oebb-monitor --debug    # write debug log to /tmp/oebb-debug.log
+oebb-monitor --debug    # write debug log to ~/.local/state/oebb-monitor/debug.log
 ```
 
 ### Keybindings
@@ -80,7 +80,7 @@ Note: live feed text (station names, destinations, remarks, notices) is provided
 ```bash
 oebb-monitor --debug
 # in a second terminal:
-tail -f /tmp/oebb-debug.log
+tail -f ~/.local/state/oebb-monitor/debug.log
 ```
 
 The log captures WebSocket events, reconnect signals, item merges, and key input.
@@ -105,7 +105,7 @@ Single-binary Rust application, split into focused modules under `src/`:
 | ratatui | 0.30 | TUI framework |
 | crossterm | 0.29 | Terminal backend |
 | tokio | 1 | Async runtime |
-| tokio-tungstenite | 0.29 | WebSocket client |
+| tokio-tungstenite | 0.30 | WebSocket client |
 | serde / serde_json | 1 | JSON deserialisation |
 | chrono | 0.4 | Time formatting |
 | anyhow | 1 | Error handling |
