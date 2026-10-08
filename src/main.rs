@@ -139,6 +139,8 @@ async fn run(terminal: &mut Tui) -> Result<()> {
 fn toggle_language(app: &mut App) {
     app.lang = app.lang.toggle();
     debug!("Language toggled to {}", app.lang.code());
+    // Tests must never overwrite the developer's real config file.
+    #[cfg(not(test))]
     config::save_language(app.lang);
 }
 
@@ -253,4 +255,264 @@ async fn handle_key(app: &Arc<Mutex<App>>, reconnect_tx: &mpsc::Sender<()>, key:
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use crate::lang::Lang;
+    use crate::model::TrainItem;
+    use crossterm::event::KeyModifiers;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ch(c: char) -> KeyEvent {
+        key(KeyCode::Char(c))
+    }
+
+    struct Harness {
+        app: Arc<Mutex<App>>,
+        tx: mpsc::Sender<()>,
+        rx: mpsc::Receiver<()>,
+    }
+
+    impl Harness {
+        fn new(trains: usize) -> Self {
+            let mut app = App::new();
+            app.lang = Lang::En;
+            app.items = (0..trains)
+                .map(|i| TrainItem {
+                    id: format!("t{i}"),
+                    train: format!("T {i}"),
+                    scheduled: "2024-01-01T10:00:00+01:00".into(),
+                    ..Default::default()
+                })
+                .collect();
+            let (tx, rx) = mpsc::channel(10);
+            Self {
+                app: Arc::new(Mutex::new(app)),
+                tx,
+                rx,
+            }
+        }
+
+        /// Press a key; returns whether the app asked to quit.
+        async fn press(&self, k: KeyEvent) -> bool {
+            handle_key(&self.app, &self.tx, k).await
+        }
+
+        fn reconnects(&mut self) -> usize {
+            let mut n = 0;
+            while self.rx.try_recv().is_ok() {
+                n += 1;
+            }
+            n
+        }
+    }
+
+    #[tokio::test]
+    async fn q_quits_from_normal_but_only_closes_detail() {
+        let h = Harness::new(2);
+        assert!(h.press(ch('q')).await);
+        assert!(h.press(ch('Q')).await);
+
+        h.press(ch('1')).await;
+        assert_eq!(h.app.lock().await.mode, AppMode::TrainDetail);
+        assert!(!h.press(ch('q')).await);
+        assert_eq!(h.app.lock().await.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn a_and_d_switch_content_type_and_reconnect() {
+        let mut h = Harness::new(0);
+        h.press(ch('a')).await;
+        assert_eq!(h.app.lock().await.content_type, ContentType::Arrival);
+        assert_eq!(h.reconnects(), 1);
+        h.press(ch('D')).await;
+        assert_eq!(h.app.lock().await.content_type, ContentType::Departure);
+        assert_eq!(h.reconnects(), 1);
+    }
+
+    #[tokio::test]
+    async fn r_requests_reconnect_without_changing_state() {
+        let mut h = Harness::new(1);
+        h.press(ch('r')).await;
+        h.press(ch('R')).await;
+        assert_eq!(h.reconnects(), 2);
+        assert_eq!(h.app.lock().await.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn digits_open_detail_for_that_train() {
+        let h = Harness::new(12);
+        h.press(ch('3')).await;
+        {
+            let app = h.app.lock().await;
+            assert_eq!(app.mode, AppMode::TrainDetail);
+            assert_eq!(app.selected_train_index, Some(2));
+            assert_eq!(app.selected_train_id.as_deref(), Some("t2"));
+        }
+        h.press(key(KeyCode::Esc)).await;
+        h.press(ch('0')).await; // 0 means the 10th row
+        assert_eq!(h.app.lock().await.selected_train_index, Some(9));
+    }
+
+    #[tokio::test]
+    async fn digit_beyond_list_is_ignored() {
+        let h = Harness::new(2);
+        h.press(ch('5')).await;
+        let app = h.app.lock().await;
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.selected_train_index, None);
+    }
+
+    #[tokio::test]
+    async fn arrows_move_selection_and_enter_opens_detail() {
+        let h = Harness::new(3);
+        h.press(key(KeyCode::Enter)).await; // nothing selected yet
+        assert_eq!(h.app.lock().await.mode, AppMode::Normal);
+
+        // The first arrow press only selects the first row.
+        h.press(key(KeyCode::Down)).await;
+        assert_eq!(h.app.lock().await.selected_train_index, Some(0));
+        h.press(key(KeyCode::Down)).await;
+        h.press(key(KeyCode::Down)).await;
+        h.press(key(KeyCode::Up)).await;
+        assert_eq!(h.app.lock().await.selected_train_index, Some(1));
+
+        h.press(key(KeyCode::Enter)).await;
+        let app = h.app.lock().await;
+        assert_eq!(app.mode, AppMode::TrainDetail);
+        assert_eq!(app.selected_train_id.as_deref(), Some("t1"));
+    }
+
+    #[tokio::test]
+    async fn detail_navigation_scroll_and_close() {
+        let h = Harness::new(3);
+        h.press(ch('1')).await;
+        h.press(key(KeyCode::Down)).await;
+        assert_eq!(h.app.lock().await.selected_train_id.as_deref(), Some("t1"));
+
+        h.press(key(KeyCode::PageDown)).await;
+        h.press(key(KeyCode::PageDown)).await;
+        assert_eq!(h.app.lock().await.detail_scroll, 6);
+        h.press(key(KeyCode::PageUp)).await;
+        assert_eq!(h.app.lock().await.detail_scroll, 3);
+        h.press(key(KeyCode::PageUp)).await;
+        h.press(key(KeyCode::PageUp)).await; // saturates at 0
+        assert_eq!(h.app.lock().await.detail_scroll, 0);
+
+        h.press(key(KeyCode::Esc)).await;
+        let app = h.app.lock().await;
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.selected_train_id, None);
+    }
+
+    #[tokio::test]
+    async fn l_toggles_language_in_both_modes() {
+        let h = Harness::new(1);
+        h.press(ch('l')).await;
+        assert_eq!(h.app.lock().await.lang, Lang::De);
+        h.press(ch('1')).await;
+        h.press(ch('L')).await;
+        assert_eq!(h.app.lock().await.lang, Lang::En);
+    }
+
+    #[tokio::test]
+    async fn station_select_flow_types_filters_and_commits() {
+        let mut h = Harness::new(0);
+        h.press(ch('s')).await;
+        assert_eq!(h.app.lock().await.mode, AppMode::StationSelect);
+
+        for c in "salzburg".chars() {
+            h.press(ch(c)).await;
+        }
+        {
+            let app = h.app.lock().await;
+            assert_eq!(app.station_search, "salzburg");
+            assert!(!app.filtered_stations.is_empty());
+        }
+        h.press(key(KeyCode::Backspace)).await;
+        assert_eq!(h.app.lock().await.station_search, "salzbur");
+
+        h.press(key(KeyCode::Down)).await;
+        h.press(key(KeyCode::Up)).await;
+        let expected = {
+            let app = h.app.lock().await;
+            app.filtered_stations[0].clone()
+        };
+        h.press(key(KeyCode::Enter)).await;
+        let app = h.app.lock().await;
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!((app.station_id.clone(), app.station_name.clone()), expected);
+        drop(app);
+        assert_eq!(h.reconnects(), 1);
+    }
+
+    #[tokio::test]
+    async fn station_select_esc_cancels_without_reconnect() {
+        let mut h = Harness::new(0);
+        let before = h.app.lock().await.station_id.clone();
+        h.press(ch('s')).await;
+        h.press(key(KeyCode::Esc)).await;
+        let app = h.app.lock().await;
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.station_id, before);
+        drop(app);
+        assert_eq!(h.reconnects(), 0);
+    }
+
+    #[tokio::test]
+    async fn station_select_enter_with_no_match_stays_and_does_not_reconnect() {
+        let mut h = Harness::new(0);
+        h.press(ch('s')).await;
+        for c in "zzzzqq".chars() {
+            h.press(ch(c)).await;
+        }
+        h.press(key(KeyCode::Enter)).await;
+        assert_eq!(h.app.lock().await.mode, AppMode::StationSelect);
+        assert_eq!(h.reconnects(), 0);
+    }
+
+    #[tokio::test]
+    async fn station_select_cursor_stays_in_bounds() {
+        let h = Harness::new(0);
+        h.press(ch('s')).await;
+        h.press(key(KeyCode::Up)).await;
+        assert_eq!(h.app.lock().await.station_list_state.selected(), Some(0));
+        for _ in 0..100 {
+            h.press(key(KeyCode::Down)).await;
+        }
+        let app = h.app.lock().await;
+        assert_eq!(
+            app.station_list_state.selected(),
+            Some(app.filtered_stations.len() - 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn station_select_swallows_command_letters_as_search_text() {
+        let mut h = Harness::new(0);
+        h.press(ch('s')).await;
+        assert!(!h.press(ch('q')).await);
+        h.press(ch('a')).await;
+        let app = h.app.lock().await;
+        assert_eq!(app.station_search, "qa");
+        assert_eq!(app.content_type, ContentType::Departure);
+        drop(app);
+        assert_eq!(h.reconnects(), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_keys_are_ignored() {
+        let mut h = Harness::new(1);
+        for k in [key(KeyCode::F(5)), ch('x'), key(KeyCode::Tab)] {
+            assert!(!h.press(k).await);
+        }
+        assert_eq!(h.reconnects(), 0);
+        assert_eq!(h.app.lock().await.mode, AppMode::Normal);
+    }
 }

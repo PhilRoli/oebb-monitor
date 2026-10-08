@@ -1,0 +1,44 @@
+{
+  "method": "update",
+  "params": {
+    "data": {
+      "departures": [
+        {
+          "id": "rj-65-20240101-1000",
+          "train": "RJX 65",
+          "line": "RJX",
+          "product": "Railjet Xpress",
+          "scheduled": "2024-01-01T10:00:00+01:00",
+          "expected": "2024-01-01T10:07:00+01:00",
+          "destination": { "default": "Salzburg Hbf", "en": "Salzburg Central" },
+          "origin": { "default": "Wien Hbf" },
+          "track": "7",
+          "sector": "A-C",
+          "via": { "default": "St. Pölten Hbf" },
+          "prioritizedVias": ["St. Pölten Hbf", "Linz/Donau Hbf"],
+          "operator": "ÖBB",
+          "remarks": [{ "text": { "default": "Verspätung" } }],
+          "unknownFutureField": { "ignored": true },
+          "formation": [
+            { "type": ["engine"], "icons": [] },
+            {
+              "wagonNumber": "21",
+              "icons": ["wlan", "bicycle"],
+              "sector": "A",
+              "destination": "Salzburg Hbf",
+              "type": ["passenger"],
+              "closed": false,
+              "symbol": "W_1"
+            }
+          ]
+        },
+        {
+          "id": "reg-1-20240101-1005",
+          "train": "REX 1",
+          "scheduled": "2024-01-01T10:05:00+01:00"
+        }
+      ],
+      "specialNotices": [{ "text": { "default": "Bauarbeiten" } }]
+    }
+  }
+}

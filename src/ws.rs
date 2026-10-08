@@ -108,77 +108,7 @@ pub async fn run_websocket(
             debug!("Spawning task for page {}: {}", page, url);
             let tx = page_tx.clone();
             let page_type = content_type.clone();
-
-            let task = tokio::spawn(async move {
-                debug!("Page {} task started, connecting...", page);
-                match connect_async(&url).await {
-                    Ok((ws_stream, _)) => {
-                        debug!("Page {} connected successfully", page);
-                        let _ = tx.send(PageEvent::Connected).await;
-                        let (mut write, mut read) = ws_stream.split();
-                        let mut msg_count = 0;
-
-                        loop {
-                            let msg = match tokio::time::timeout(READ_TIMEOUT, read.next()).await {
-                                Ok(Some(msg)) => msg,
-                                Ok(None) => break,
-                                Err(_) => {
-                                    debug!("Page {} timed out after {:?}", page, READ_TIMEOUT);
-                                    break;
-                                }
-                            };
-                            match msg {
-                                Ok(Message::Text(text)) => {
-                                    msg_count += 1;
-                                    if let Ok(mut ws_msg) = serde_json::from_str::<WsMessage>(&text)
-                                    {
-                                        if ws_msg.method.as_deref() == Some("update") {
-                                            if let Some(mut params) = ws_msg.params.take() {
-                                                // Narrow to the type this socket was opened
-                                                // for, not whatever the UI has selected now.
-                                                let items = match page_type {
-                                                    ContentType::Departure => {
-                                                        params.data.departures.take()
-                                                    }
-                                                    ContentType::Arrival => {
-                                                        params.data.arrivals.take()
-                                                    }
-                                                }
-                                                .unwrap_or_default();
-                                                let _ = tx
-                                                    .send(PageEvent::Update(page, items, params))
-                                                    .await;
-                                            }
-                                        }
-                                    } else {
-                                        debug!("Page {} failed to parse message", page);
-                                    }
-                                }
-                                Ok(Message::Ping(payload)) => {
-                                    if write.send(Message::Pong(payload)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Ok(Message::Close(reason)) => {
-                                    debug!("Page {} WebSocket closed: {:?}", page, reason);
-                                    break;
-                                }
-                                Err(e) => {
-                                    debug!("Page {} WebSocket error: {}", page, e);
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                        debug!("Page {} task ending after {} messages", page, msg_count);
-                        let _ = tx.send(PageEvent::Ended(page)).await;
-                    }
-                    Err(e) => {
-                        debug!("Page {} failed to connect: {}", page, e);
-                        let _ = tx.send(PageEvent::Failed).await;
-                    }
-                }
-            });
+            let task = tokio::spawn(run_page(page, url, page_type, tx, READ_TIMEOUT));
 
             active_tasks.push(task);
         }
@@ -227,18 +157,7 @@ pub async fn run_websocket(
 
                             per_page.insert(page, new_items);
 
-                            let mut merged: Vec<TrainItem> = Vec::new();
-                            let mut seen = std::collections::HashSet::new();
-                            let mut pages: Vec<_> = per_page.keys().copied().collect();
-                            pages.sort_unstable();
-                            for p in pages {
-                                for item in &per_page[&p] {
-                                    if seen.insert(item.id.clone()) {
-                                        merged.push(item.clone());
-                                    }
-                                }
-                            }
-                            merged.sort_by(|a, b| a.scheduled.cmp(&b.scheduled));
+                            let merged = merge_pages(&per_page);
 
                             let mut app = app.lock().await;
                             debug!("Merged items: {} -> {}", app.items.len(), merged.len());
@@ -280,6 +199,99 @@ pub async fn run_websocket(
     }
 }
 
+/// Pull the board for `content_type` out of an update payload.
+fn extract_items(params: &mut UpdateParams, content_type: &ContentType) -> Vec<TrainItem> {
+    match content_type {
+        ContentType::Departure => params.data.departures.take(),
+        ContentType::Arrival => params.data.arrivals.take(),
+    }
+    .unwrap_or_default()
+}
+
+/// Union of all pages' items, deduplicated by id (lowest page wins) and sorted
+/// by scheduled time.
+fn merge_pages(per_page: &HashMap<usize, Vec<TrainItem>>) -> Vec<TrainItem> {
+    let mut pages: Vec<_> = per_page.keys().copied().collect();
+    pages.sort_unstable();
+    let mut seen = std::collections::HashSet::new();
+    let mut merged: Vec<TrainItem> = pages
+        .into_iter()
+        .flat_map(|p| per_page[&p].iter())
+        .filter(|item| seen.insert(item.id.clone()))
+        .cloned()
+        .collect();
+    merged.sort_by(|a, b| a.scheduled.cmp(&b.scheduled));
+    merged
+}
+
+/// Drive one page's socket until it closes, errors or stays silent for
+/// `read_timeout`, forwarding events to the coordinator.
+async fn run_page(
+    page: usize,
+    url: String,
+    content_type: ContentType,
+    tx: mpsc::Sender<PageEvent>,
+    read_timeout: Duration,
+) {
+    debug!("Page {} task started, connecting...", page);
+    let ws_stream = match connect_async(&url).await {
+        Ok((ws_stream, _)) => ws_stream,
+        Err(e) => {
+            debug!("Page {} failed to connect: {}", page, e);
+            let _ = tx.send(PageEvent::Failed).await;
+            return;
+        }
+    };
+    debug!("Page {} connected successfully", page);
+    let _ = tx.send(PageEvent::Connected).await;
+    let (mut write, mut read) = ws_stream.split();
+    let mut msg_count = 0;
+
+    loop {
+        let msg = match tokio::time::timeout(read_timeout, read.next()).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => break,
+            Err(_) => {
+                debug!("Page {} timed out after {:?}", page, read_timeout);
+                break;
+            }
+        };
+        match msg {
+            Ok(Message::Text(text)) => {
+                msg_count += 1;
+                match serde_json::from_str::<WsMessage>(&text) {
+                    Ok(mut ws_msg) if ws_msg.method.as_deref() == Some("update") => {
+                        if let Some(mut params) = ws_msg.params.take() {
+                            // Narrow to the type this socket was opened for,
+                            // not whatever the UI has selected now.
+                            let items = extract_items(&mut params, &content_type);
+                            let _ = tx.send(PageEvent::Update(page, items, params)).await;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => debug!("Page {} failed to parse message", page),
+                }
+            }
+            Ok(Message::Ping(payload)) => {
+                if write.send(Message::Pong(payload)).await.is_err() {
+                    break;
+                }
+            }
+            Ok(Message::Close(reason)) => {
+                debug!("Page {} WebSocket closed: {:?}", page, reason);
+                break;
+            }
+            Err(e) => {
+                debug!("Page {} WebSocket error: {}", page, e);
+                break;
+            }
+            _ => {}
+        }
+    }
+    debug!("Page {} task ending after {} messages", page, msg_count);
+    let _ = tx.send(PageEvent::Ended(page)).await;
+}
+
 /// Waits out the (jittered) backoff, but returns early with `false` if a
 /// manual reconnect arrives, so pressing R never has to wait for the delay.
 /// Returns `true` if the full delay elapsed.
@@ -302,5 +314,286 @@ async fn backoff_or_reconnect(
             *backoff = Duration::from_secs(1);
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+
+    const DEPARTURES: &str = include_str!("../tests/fixtures/update_departures.json");
+    const ARRIVALS: &str = include_str!("../tests/fixtures/update_arrivals.json");
+    const NON_UPDATE: &str = include_str!("../tests/fixtures/non_update.json");
+
+    fn train(id: &str, scheduled: &str) -> TrainItem {
+        TrainItem {
+            id: id.to_string(),
+            train: id.to_string(),
+            scheduled: scheduled.to_string(),
+            ..Default::default()
+        }
+    }
+
+    // ---- pure helpers -------------------------------------------------
+
+    #[test]
+    fn merge_sorts_by_scheduled_time() {
+        let mut pages = HashMap::new();
+        pages.insert(1, vec![train("b", "2024-01-01T10:10:00+01:00")]);
+        pages.insert(2, vec![train("a", "2024-01-01T10:00:00+01:00")]);
+        let ids: Vec<_> = merge_pages(&pages).into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn merge_dedupes_by_id_preferring_lowest_page() {
+        let mut first = train("x", "2024-01-01T10:00:00+01:00");
+        first.track = Some("1".into());
+        let mut second = train("x", "2024-01-01T10:00:00+01:00");
+        second.track = Some("2".into());
+        let mut pages = HashMap::new();
+        pages.insert(2, vec![second]);
+        pages.insert(1, vec![first]);
+        let merged = merge_pages(&pages);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].track.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn merge_reflects_replaced_page_so_changes_and_departures_apply() {
+        let mut pages = HashMap::new();
+        let mut old = train("x", "2024-01-01T10:00:00+01:00");
+        old.expected = None;
+        pages.insert(1, vec![old, train("gone", "2024-01-01T10:01:00+01:00")]);
+        assert_eq!(merge_pages(&pages).len(), 2);
+
+        // A fresh update for the same page replaces it wholesale.
+        let mut updated = train("x", "2024-01-01T10:00:00+01:00");
+        updated.expected = Some("2024-01-01T10:09:00+01:00".into());
+        pages.insert(1, vec![updated]);
+        let merged = merge_pages(&pages);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].expected.as_deref(),
+            Some("2024-01-01T10:09:00+01:00")
+        );
+    }
+
+    #[test]
+    fn merge_empty() {
+        assert!(merge_pages(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn extract_items_picks_requested_type_only() {
+        let msg: WsMessage = serde_json::from_str(DEPARTURES).unwrap();
+        let mut params = msg.params.unwrap();
+        assert!(extract_items(&mut params, &ContentType::Arrival).is_empty());
+        assert_eq!(extract_items(&mut params, &ContentType::Departure).len(), 2);
+    }
+
+    #[test]
+    fn jitter_stays_within_25_percent() {
+        for _ in 0..50 {
+            let d = jittered(Duration::from_secs(8));
+            assert!(d >= Duration::from_secs(8) && d <= Duration::from_secs(10));
+        }
+    }
+
+    #[tokio::test]
+    async fn backoff_doubles_and_caps() {
+        let (_tx, mut rx) = mpsc::channel(1);
+        let mut backoff = Duration::from_millis(1);
+        tokio::time::pause();
+        assert!(backoff_or_reconnect(&mut backoff, 0, &mut rx).await);
+        assert_eq!(backoff, Duration::from_millis(2));
+        backoff = MAX_BACKOFF;
+        assert!(backoff_or_reconnect(&mut backoff, 0, &mut rx).await);
+        assert_eq!(backoff, MAX_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn backoff_resets_after_successful_session() {
+        let (_tx, mut rx) = mpsc::channel(1);
+        tokio::time::pause();
+        let mut backoff = Duration::from_secs(16);
+        assert!(backoff_or_reconnect(&mut backoff, 3, &mut rx).await);
+        assert_eq!(backoff, Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn manual_reconnect_interrupts_backoff() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(()).await.unwrap();
+        let mut backoff = Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        assert!(!backoff_or_reconnect(&mut backoff, 0, &mut rx).await);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(backoff, Duration::from_secs(1));
+    }
+
+    // ---- run_page against a local WebSocket server ---------------------
+
+    /// Bind a local server, run `handler` on the first accepted connection,
+    /// and return its `ws://` URL.
+    async fn serve<F, Fut>(handler: F) -> String
+    where
+        F: FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = accept_async(stream).await.unwrap();
+            handler(ws).await;
+        });
+        format!("ws://{}", addr)
+    }
+
+    async fn next_event(rx: &mut mpsc::Receiver<PageEvent>) -> PageEvent {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for event")
+            .expect("channel closed")
+    }
+
+    #[tokio::test]
+    async fn page_forwards_updates_then_reports_end_on_close() {
+        let url = serve(|mut ws| async move {
+            ws.send(Message::text(NON_UPDATE)).await.unwrap(); // ignored
+            ws.send(Message::text("garbage")).await.unwrap(); // ignored
+            ws.send(Message::text(DEPARTURES)).await.unwrap();
+            ws.close(None).await.unwrap();
+        })
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(10);
+        tokio::spawn(run_page(
+            3,
+            url,
+            ContentType::Departure,
+            tx,
+            Duration::from_secs(5),
+        ));
+
+        assert!(matches!(next_event(&mut rx).await, PageEvent::Connected));
+        match next_event(&mut rx).await {
+            PageEvent::Update(page, items, params) => {
+                assert_eq!(page, 3);
+                assert_eq!(items.len(), 2);
+                assert_eq!(params.data.special_notices.unwrap().len(), 1);
+            }
+            _ => panic!("expected Update"),
+        }
+        assert!(matches!(next_event(&mut rx).await, PageEvent::Ended(3)));
+    }
+
+    #[tokio::test]
+    async fn page_uses_its_own_content_type_not_the_payload_mix() {
+        // Departure payload read by an arrival socket yields no items.
+        let url = serve(|mut ws| async move {
+            ws.send(Message::text(DEPARTURES)).await.unwrap();
+            ws.send(Message::text(ARRIVALS)).await.unwrap();
+            ws.close(None).await.unwrap();
+        })
+        .await;
+        let (tx, mut rx) = mpsc::channel(10);
+        tokio::spawn(run_page(
+            1,
+            url,
+            ContentType::Arrival,
+            tx,
+            Duration::from_secs(5),
+        ));
+
+        assert!(matches!(next_event(&mut rx).await, PageEvent::Connected));
+        let PageEvent::Update(_, first, _) = next_event(&mut rx).await else {
+            panic!("expected Update")
+        };
+        assert!(first.is_empty());
+        let PageEvent::Update(_, second, _) = next_event(&mut rx).await else {
+            panic!("expected Update")
+        };
+        assert_eq!(second[0].id, "a1");
+    }
+
+    #[tokio::test]
+    async fn page_answers_ping_with_matching_pong() {
+        let (pong_tx, pong_rx) = tokio::sync::oneshot::channel();
+        let url = serve(|mut ws| async move {
+            ws.send(Message::Ping(b"hello".to_vec().into()))
+                .await
+                .unwrap();
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Pong(p) = msg {
+                    let _ = pong_tx.send(p.to_vec());
+                    break;
+                }
+            }
+            let _ = ws.close(None).await;
+        })
+        .await;
+        let (tx, mut rx) = mpsc::channel(10);
+        tokio::spawn(run_page(
+            1,
+            url,
+            ContentType::Departure,
+            tx,
+            Duration::from_secs(5),
+        ));
+
+        let payload = tokio::time::timeout(Duration::from_secs(5), pong_rx)
+            .await
+            .expect("no pong received")
+            .unwrap();
+        assert_eq!(payload, b"hello");
+        // Drain until the page ends so the task finishes cleanly.
+        while !matches!(next_event(&mut rx).await, PageEvent::Ended(_)) {}
+    }
+
+    #[tokio::test]
+    async fn silent_socket_times_out_and_ends() {
+        let url = serve(|ws| async move {
+            // Hold the connection open without sending anything.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(ws);
+        })
+        .await;
+        let (tx, mut rx) = mpsc::channel(10);
+        tokio::spawn(run_page(
+            2,
+            url,
+            ContentType::Departure,
+            tx,
+            Duration::from_millis(150),
+        ));
+
+        assert!(matches!(next_event(&mut rx).await, PageEvent::Connected));
+        assert!(matches!(next_event(&mut rx).await, PageEvent::Ended(2)));
+    }
+
+    #[tokio::test]
+    async fn connect_failure_reports_failed() {
+        // Bind then drop to get a port nothing is listening on.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (tx, mut rx) = mpsc::channel(10);
+        tokio::spawn(run_page(
+            1,
+            format!("ws://{}", addr),
+            ContentType::Departure,
+            tx,
+            Duration::from_secs(1),
+        ));
+        assert!(matches!(next_event(&mut rx).await, PageEvent::Failed));
     }
 }

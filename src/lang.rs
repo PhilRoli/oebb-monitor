@@ -41,9 +41,13 @@ impl Lang {
     /// Detect the language from locale env vars: an English locale yields
     /// [`Lang::En`], anything else (including unset / `C` / `POSIX`) yields German.
     pub fn detect() -> Lang {
+        Self::detect_from(|key| std::env::var_os(key).map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    fn detect_from(get: impl Fn(&str) -> Option<String>) -> Lang {
         for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
-            if let Some(v) = std::env::var_os(key) {
-                let v = v.to_string_lossy().to_lowercase();
+            if let Some(v) = get(key) {
+                let v = v.to_lowercase();
                 if !v.is_empty() {
                     return if v.starts_with("en") {
                         Lang::En
@@ -295,6 +299,7 @@ static EN: Tr = Tr {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -332,5 +337,84 @@ mod tests {
         assert_eq!(Lang::De.icon_label("wlan"), "📶 WLAN");
         assert_eq!(Lang::En.icon_label("wlan"), "📶 Wi-Fi");
         assert_eq!(Lang::En.icon_label("unknown_code"), "unknown_code");
+    }
+
+    fn env(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs = pairs.to_vec();
+        move |k| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn detect_english_locales() {
+        assert_eq!(Lang::detect_from(env(&[("LANG", "en_US.UTF-8")])), Lang::En);
+        assert_eq!(Lang::detect_from(env(&[("LC_ALL", "EN_GB")])), Lang::En);
+    }
+
+    #[test]
+    fn detect_defaults_to_german() {
+        assert_eq!(Lang::detect_from(env(&[])), Lang::De);
+        assert_eq!(Lang::detect_from(env(&[("LANG", "C")])), Lang::De);
+        assert_eq!(Lang::detect_from(env(&[("LANG", "de_AT.UTF-8")])), Lang::De);
+        assert_eq!(Lang::detect_from(env(&[("LANG", "")])), Lang::De);
+    }
+
+    #[test]
+    fn detect_precedence_lc_all_over_lang() {
+        let e = env(&[("LC_ALL", "de_DE"), ("LANG", "en_US")]);
+        assert_eq!(Lang::detect_from(e), Lang::De);
+        let e = env(&[("LC_ALL", ""), ("LANG", "en_US")]);
+        assert_eq!(Lang::detect_from(e), Lang::En);
+    }
+
+    #[test]
+    fn toggle_is_an_involution() {
+        for l in [Lang::De, Lang::En] {
+            assert_eq!(l.toggle().toggle(), l);
+            assert_ne!(l.toggle(), l);
+        }
+    }
+
+    #[test]
+    fn string_tables_match_language_and_differ() {
+        assert!(std::ptr::eq(Lang::De.tr(), &DE));
+        assert!(std::ptr::eq(Lang::En.tr(), &EN));
+        assert_ne!(DE.departures, EN.departures);
+        assert!(!DE.departures.is_empty() && !EN.departures.is_empty());
+        assert!(!DE.connection_failed.is_empty() && !EN.connection_failed.is_empty());
+    }
+
+    #[test]
+    fn class_label_combinations() {
+        assert_eq!(Lang::De.class_label("W_2").as_deref(), Some("2. Klasse"));
+        assert_eq!(
+            Lang::En.class_label("W_1_B").as_deref(),
+            Some("1st class + Business")
+        );
+        assert_eq!(
+            Lang::En.class_label("TW_B_1").as_deref(),
+            Some("Business + 1st class")
+        );
+        assert_eq!(Lang::En.class_label("L"), None);
+        assert_eq!(Lang::En.class_label(""), None);
+    }
+
+    #[test]
+    fn car_type_first_notable_wins() {
+        let types = vec![
+            "unknown".to_string(),
+            "couchette".to_string(),
+            "sleeper".to_string(),
+        ];
+        assert_eq!(Lang::En.car_type_label(&types), Some("🛌 Couchette"));
+        assert_eq!(Lang::En.car_type_label(&[]), None);
+        assert_eq!(
+            Lang::De.car_type_label(&["restaurant".to_string()]),
+            Lang::En.car_type_label(&["restaurant".to_string()])
+        );
     }
 }

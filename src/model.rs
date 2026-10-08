@@ -86,3 +86,83 @@ pub struct WsMessage {
     pub method: Option<String>,
     pub params: Option<UpdateParams>,
 }
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    const DEPARTURES: &str = include_str!("../tests/fixtures/update_departures.json");
+    const ARRIVALS: &str = include_str!("../tests/fixtures/update_arrivals.json");
+    const NON_UPDATE: &str = include_str!("../tests/fixtures/non_update.json");
+
+    #[test]
+    fn parses_full_departure_payload() {
+        let msg: WsMessage = serde_json::from_str(DEPARTURES).unwrap();
+        assert_eq!(msg.method.as_deref(), Some("update"));
+        let data = msg.params.unwrap().data;
+        assert!(data.arrivals.is_none());
+        let deps = data.departures.unwrap();
+        assert_eq!(deps.len(), 2);
+
+        let t = &deps[0];
+        assert_eq!(t.id, "rj-65-20240101-1000");
+        assert_eq!(t.train, "RJX 65");
+        assert_eq!(t.line.as_deref(), Some("RJX"));
+        assert_eq!(t.destination.as_ref().unwrap().default, "Salzburg Hbf");
+        assert_eq!(t.track.as_deref(), Some("7"));
+        assert_eq!(t.prioritized_vias.as_ref().unwrap().len(), 2);
+        assert_eq!(t.remarks.as_ref().unwrap()[0].text.default, "Verspätung");
+
+        let formation = t.formation.as_ref().unwrap();
+        assert_eq!(formation.len(), 2);
+        assert!(formation[0].wagon_number.is_none(), "loco has no number");
+        assert_eq!(
+            formation[0].car_type.as_deref(),
+            Some(&["engine".to_string()][..])
+        );
+        assert_eq!(formation[1].wagon_number.as_deref(), Some("21"));
+        assert_eq!(formation[1].closed, Some(false));
+        assert_eq!(formation[1].symbol.as_deref(), Some("W_1"));
+
+        let notices = data.special_notices.unwrap();
+        assert_eq!(notices[0].text.default, "Bauarbeiten");
+    }
+
+    #[test]
+    fn minimal_train_only_needs_id_train_scheduled() {
+        let msg: WsMessage = serde_json::from_str(DEPARTURES).unwrap();
+        let deps = msg.params.unwrap().data.departures.unwrap();
+        let t = &deps[1];
+        assert_eq!(t.train, "REX 1");
+        assert!(t.expected.is_none() && t.destination.is_none() && t.formation.is_none());
+    }
+
+    #[test]
+    fn parses_arrival_payload() {
+        let msg: WsMessage = serde_json::from_str(ARRIVALS).unwrap();
+        let data = msg.params.unwrap().data;
+        assert!(data.departures.is_none());
+        assert!(data.special_notices.is_none());
+        let arr = data.arrivals.unwrap();
+        assert_eq!(arr[0].origin.as_ref().unwrap().default, "Graz Hbf");
+    }
+
+    #[test]
+    fn non_update_message_has_no_params() {
+        let msg: WsMessage = serde_json::from_str(NON_UPDATE).unwrap();
+        assert_eq!(msg.method.as_deref(), Some("hello"));
+        assert!(msg.params.is_none());
+    }
+
+    #[test]
+    fn missing_required_fields_is_an_error() {
+        let bad = r#"{"method":"update","params":{"data":{"departures":[{"train":"X"}]}}}"#;
+        assert!(serde_json::from_str::<WsMessage>(bad).is_err());
+    }
+
+    #[test]
+    fn garbage_is_an_error() {
+        assert!(serde_json::from_str::<WsMessage>("not json").is_err());
+    }
+}

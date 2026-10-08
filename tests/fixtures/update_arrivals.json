@@ -1,0 +1,1 @@
+{"method":"update","params":{"data":{"arrivals":[{"id":"a1","train":"IC 540","scheduled":"2024-01-01T11:00:00+01:00","origin":{"default":"Graz Hbf"}}]}}}

@@ -653,6 +653,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -662,5 +663,216 @@ mod tests {
         assert_eq!(delay_color(3), Color::Yellow);
         assert_eq!(delay_color(5), Color::Yellow);
         assert_eq!(delay_color(6), Color::Red);
+    }
+
+    use crate::lang::Lang;
+    use crate::model::WsMessage;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    const FIXTURE: &str = include_str!("../tests/fixtures/update_departures.json");
+
+    /// An app loaded from the departure fixture, with English strings.
+    fn loaded_app() -> App {
+        let data = serde_json::from_str::<WsMessage>(FIXTURE)
+            .unwrap()
+            .params
+            .unwrap()
+            .data;
+        let mut app = App::new();
+        app.lang = Lang::En;
+        app.items = data.departures.unwrap();
+        app.special_notices = data.special_notices.unwrap();
+        app.connection = ConnectionState::Connected;
+        app
+    }
+
+    /// Render one frame and return the buffer as newline-joined text.
+    fn render(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| ui(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn main_board_shows_station_trains_delay_and_notices() {
+        let mut app = loaded_app();
+        let out = render(&mut app, 140, 40);
+        assert!(out.contains(app.lang.tr().departures), "{out}");
+        assert!(out.contains(&app.station_name));
+        assert!(out.contains("RJX 65"));
+        assert!(out.contains("REX 1"));
+        assert!(out.contains("Salzburg Hbf"));
+        assert!(out.contains("+7"), "delay column");
+        assert!(out.contains("Bauarbeiten"), "special notice");
+    }
+
+    #[test]
+    fn main_board_arrivals_use_origin_column_and_title() {
+        let mut app = loaded_app();
+        app.content_type = ContentType::Arrival;
+        app.items[0].origin = Some(crate::model::Destination {
+            default: "Wien Hbf".into(),
+        });
+        let out = render(&mut app, 140, 40);
+        assert!(out.contains(Lang::En.tr().arrivals));
+        assert!(out.contains(Lang::En.tr().col_from));
+        assert!(out.contains("Wien Hbf"));
+    }
+
+    #[test]
+    fn german_strings_are_used_when_selected() {
+        let mut app = loaded_app();
+        app.lang = Lang::De;
+        let out = render(&mut app, 140, 40);
+        assert!(out.contains(Lang::De.tr().departures));
+        assert!(!out.contains(Lang::En.tr().departures));
+    }
+
+    #[test]
+    fn status_bar_reflects_connection_state() {
+        let mut app = loaded_app();
+        let tr = app.lang.tr();
+
+        app.connection = ConnectionState::Connecting;
+        assert!(render(&mut app, 140, 40).contains(tr.connecting));
+
+        app.connection = ConnectionState::Failed;
+        assert!(render(&mut app, 140, 40).contains(tr.connection_failed));
+
+        app.connection = ConnectionState::Connected;
+        app.last_update = None;
+        assert!(render(&mut app, 140, 40).contains(tr.connected));
+
+        app.last_update = Some(chrono::Local::now());
+        let out = render(&mut app, 140, 40);
+        assert!(out.contains(tr.last_update));
+        assert!(!out.contains(tr.connecting));
+    }
+
+    #[test]
+    fn empty_board_renders() {
+        let mut app = App::new();
+        app.lang = Lang::En;
+        let out = render(&mut app, 120, 30);
+        assert!(out.contains(&app.station_name));
+    }
+
+    #[test]
+    fn train_detail_shows_fields_and_formation() {
+        let mut app = loaded_app();
+        app.mode = AppMode::TrainDetail;
+        app.selected_train_index = Some(0);
+        app.selected_train_id = Some(app.items[0].id.clone());
+        let out = render(&mut app, 140, 60);
+        assert!(out.contains("RJX 65"));
+        assert!(out.contains("Salzburg Hbf"));
+        assert!(out.contains("+7"));
+        assert!(out.contains("ÖBB"), "operator");
+        assert!(out.contains("Verspätung"), "remark");
+        assert!(out.contains("1st class"), "decoded wagon class");
+        assert!(out.contains(app.lang.tr().detail_help));
+    }
+
+    #[test]
+    fn train_detail_minimal_train_renders() {
+        let mut app = loaded_app();
+        app.mode = AppMode::TrainDetail;
+        app.selected_train_index = Some(1);
+        let out = render(&mut app, 140, 40);
+        assert!(out.contains("REX 1"));
+    }
+
+    #[test]
+    fn train_detail_without_selection_says_so() {
+        let mut app = loaded_app();
+        app.mode = AppMode::TrainDetail;
+        app.selected_train_index = None;
+        assert!(render(&mut app, 120, 40).contains(app.lang.tr().no_train));
+    }
+
+    #[test]
+    fn train_detail_with_stale_index_does_not_panic() {
+        let mut app = loaded_app();
+        app.mode = AppMode::TrainDetail;
+        app.selected_train_index = Some(99);
+        assert!(render(&mut app, 120, 40).contains(app.lang.tr().no_train));
+    }
+
+    #[test]
+    fn detail_scroll_past_end_does_not_panic() {
+        let mut app = loaded_app();
+        app.mode = AppMode::TrainDetail;
+        app.selected_train_index = Some(0);
+        app.detail_scroll = u16::MAX;
+        render(&mut app, 120, 40);
+    }
+
+    #[test]
+    fn station_select_shows_search_and_results() {
+        let mut app = loaded_app();
+        app.enter_station_select();
+        for c in "salz".chars() {
+            app.station_search.push(c);
+        }
+        app.update_filtered_stations();
+        let out = render(&mut app, 120, 40);
+        assert!(out.contains("Search: salz_"), "search prompt and text");
+        let first = &app.filtered_stations[0].1;
+        assert!(out.contains(first.as_str()));
+    }
+
+    #[test]
+    fn station_select_with_no_matches_renders() {
+        let mut app = loaded_app();
+        app.enter_station_select();
+        app.station_search = "zzzzzz".into();
+        app.update_filtered_stations();
+        render(&mut app, 120, 40);
+    }
+
+    #[test]
+    fn every_mode_survives_tiny_and_odd_terminal_sizes() {
+        for (w, h) in [(1, 1), (10, 3), (20, 5), (40, 10), (80, 24), (300, 100)] {
+            for mode in [
+                AppMode::Normal,
+                AppMode::TrainDetail,
+                AppMode::StationSelect,
+            ] {
+                for lang in [Lang::De, Lang::En] {
+                    let mut app = loaded_app();
+                    app.lang = lang;
+                    app.mode = mode.clone();
+                    app.selected_train_index = Some(0);
+                    if mode == AppMode::StationSelect {
+                        app.enter_station_select();
+                    }
+                    render(&mut app, w, h);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn many_trains_render_with_selection() {
+        let mut app = loaded_app();
+        let template = app.items[1].clone();
+        app.items = (0..200)
+            .map(|i| crate::model::TrainItem {
+                id: format!("t{i}"),
+                train: format!("Zug {i}"),
+                ..template.clone()
+            })
+            .collect();
+        app.selected_train_index = Some(150);
+        let out = render(&mut app, 140, 30);
+        assert!(out.contains("Zug"));
     }
 }

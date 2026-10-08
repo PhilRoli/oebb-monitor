@@ -18,3 +18,7 @@ serde_json = "1.0"
 futures-util = "0.3"
 chrono = "0.4"
 anyhow = "1.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "test-util"] }
+tempfile = "3"
