@@ -79,6 +79,7 @@ jobs:
     outputs:
       arm64_sha256:  ${{ steps.sha.outputs.arm64 }}
       x86_64_sha256: ${{ steps.sha.outputs.x86_64 }}
+      linux_sha256:  ${{ steps.sha.outputs.linux }}
 
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -90,6 +91,7 @@ jobs:
         run: |
           echo "arm64=$(shasum  -a 256 oebb-monitor-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           echo "x86_64=$(shasum -a 256 oebb-monitor-x86_64-apple-darwin.tar.gz  | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux=$(shasum  -a 256 oebb-monitor-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
@@ -117,6 +119,7 @@ jobs:
           VERSION:    ${{ github.ref_name }}
           ARM64_SHA:  ${{ needs.release.outputs.arm64_sha256 }}
           X86_64_SHA: ${{ needs.release.outputs.x86_64_sha256 }}
+          LINUX_SHA:  ${{ needs.release.outputs.linux_sha256 }}
           REPO:       ${{ github.repository }}
         run: |
           python3 << 'EOF'
@@ -125,6 +128,7 @@ jobs:
           version = os.environ['VERSION'].lstrip('v')
           arm64   = os.environ['ARM64_SHA']
           x86_64  = os.environ['X86_64_SHA']
+          linux   = os.environ['LINUX_SHA']
           repo    = os.environ['REPO']
           base    = f"https://github.com/{repo}/releases/download/v{version}"
 
@@ -138,12 +142,17 @@ jobs:
                   sys.exit(f"formula pattern matched {n} times (expected 1): {pattern}")
 
           sub(r'version "[^"]*"', f'version "{version}"')
-          sub(r'(on_arm do\n\s+url ")[^"]*"',
-              rf'\g<1>{base}/oebb-monitor-aarch64-apple-darwin.tar.gz"')
-          sub(r'(on_arm do\n\s+url "[^"]*"\n\s+sha256 ")[^"]*"', rf'\g<1>{arm64}"')
-          sub(r'(on_intel do\n\s+url ")[^"]*"',
-              rf'\g<1>{base}/oebb-monitor-x86_64-apple-darwin.tar.gz"')
-          sub(r'(on_intel do\n\s+url "[^"]*"\n\s+sha256 ")[^"]*"', rf'\g<1>{x86_64}"')
+          # Anchor on the asset names: on_intel appears under both macOS and Linux.
+          for blockkey, asset, sha in [
+              ('on_arm', 'aarch64-apple-darwin', arm64),
+              ('on_intel', 'x86_64-apple-darwin', x86_64),
+              ('on_intel', 'x86_64-unknown-linux-gnu', linux),
+          ]:
+              name = f'oebb-monitor-{asset}.tar.gz'
+              sub(rf'({blockkey} do\n\s+url ")[^"]*{re.escape(name)}"',
+                  rf'\g<1>{base}/{name}"')
+              sub(rf'({blockkey} do\n\s+url "[^"]*{re.escape(name)}"\n\s+sha256 ")[^"]*"',
+                  rf'\g<1>{sha}"')
 
           open(path, 'w').write(text)
           print(f"Updated formula to v{version}")
