@@ -1,12 +1,16 @@
 use anyhow::Result;
 use chrono::Local;
-use futures_util::StreamExt;
-use std::{sync::Arc, time::Duration};
+use futures_util::{SinkExt, StreamExt};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use crate::app::{build_ws_url, App, ConnectionState, ContentType};
 use crate::model::{TrainItem, UpdateParams, WsMessage};
+
+/// How long a page socket may stay silent before it is considered dead.
+const READ_TIMEOUT: Duration = Duration::from_secs(90);
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Events emitted by a single per-page WebSocket worker task back to the
 /// coordinating loop in [`run_websocket`].
@@ -15,8 +19,20 @@ enum PageEvent {
     Connected,
     /// The page failed to connect at all.
     Failed,
-    /// The page delivered a fresh `update` payload.
-    Update(usize, UpdateParams),
+    /// A connected page socket closed, errored or went silent.
+    Ended(usize),
+    /// The page delivered a fresh `update` payload, already narrowed to the
+    /// items of the content type its socket was opened for.
+    Update(usize, Vec<TrainItem>, UpdateParams),
+}
+
+/// Backoff delay with up to ~25% jitter so parallel clients don't sync up.
+fn jittered(base: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    base + base.mul_f64(f64::from(nanos % 1000) / 4000.0)
 }
 
 /// Drives the live data connection for the lifetime of the program.
@@ -91,6 +107,7 @@ pub async fn run_websocket(
             let url = build_ws_url(&station_id, &content_type, page);
             debug!("Spawning task for page {}: {}", page, url);
             let tx = page_tx.clone();
+            let page_type = content_type.clone();
 
             let task = tokio::spawn(async move {
                 debug!("Page {} task started, connecting...", page);
@@ -98,22 +115,48 @@ pub async fn run_websocket(
                     Ok((ws_stream, _)) => {
                         debug!("Page {} connected successfully", page);
                         let _ = tx.send(PageEvent::Connected).await;
-                        let (_, mut read) = ws_stream.split();
+                        let (mut write, mut read) = ws_stream.split();
                         let mut msg_count = 0;
 
-                        while let Some(msg) = read.next().await {
+                        loop {
+                            let msg = match tokio::time::timeout(READ_TIMEOUT, read.next()).await {
+                                Ok(Some(msg)) => msg,
+                                Ok(None) => break,
+                                Err(_) => {
+                                    debug!("Page {} timed out after {:?}", page, READ_TIMEOUT);
+                                    break;
+                                }
+                            };
                             match msg {
                                 Ok(Message::Text(text)) => {
                                     msg_count += 1;
-                                    if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
+                                    if let Ok(mut ws_msg) = serde_json::from_str::<WsMessage>(&text)
+                                    {
                                         if ws_msg.method.as_deref() == Some("update") {
-                                            if let Some(params) = ws_msg.params {
-                                                let _ =
-                                                    tx.send(PageEvent::Update(page, params)).await;
+                                            if let Some(mut params) = ws_msg.params.take() {
+                                                // Narrow to the type this socket was opened
+                                                // for, not whatever the UI has selected now.
+                                                let items = match page_type {
+                                                    ContentType::Departure => {
+                                                        params.data.departures.take()
+                                                    }
+                                                    ContentType::Arrival => {
+                                                        params.data.arrivals.take()
+                                                    }
+                                                }
+                                                .unwrap_or_default();
+                                                let _ = tx
+                                                    .send(PageEvent::Update(page, items, params))
+                                                    .await;
                                             }
                                         }
                                     } else {
                                         debug!("Page {} failed to parse message", page);
+                                    }
+                                }
+                                Ok(Message::Ping(payload)) => {
+                                    if write.send(Message::Pong(payload)).await.is_err() {
+                                        break;
                                     }
                                 }
                                 Ok(Message::Close(reason)) => {
@@ -128,6 +171,7 @@ pub async fn run_websocket(
                             }
                         }
                         debug!("Page {} task ending after {} messages", page, msg_count);
+                        let _ = tx.send(PageEvent::Ended(page)).await;
                     }
                     Err(e) => {
                         debug!("Page {} failed to connect: {}", page, e);
@@ -142,9 +186,9 @@ pub async fn run_websocket(
         drop(page_tx);
         debug!("Spawned {} tasks, now listening for updates", max_pages);
 
-        // Items are accumulated fresh each iteration so trains that have since
-        // departed drop off, then published to the shared state on every batch.
-        let mut collected: Vec<TrainItem> = Vec::new();
+        // Items are tracked per page and rebuilt from scratch on every update,
+        // so changed trains are refreshed and departed ones drop off.
+        let mut per_page: HashMap<usize, Vec<TrainItem>> = HashMap::new();
         let mut update_count = 0;
         let mut failed_count = 0;
         let mut connected_any = false;
@@ -166,27 +210,39 @@ pub async fn run_websocket(
                                 notify.notify_one();
                             }
                         }
-                        Some(PageEvent::Update(page, params)) => {
+                        Some(PageEvent::Ended(page)) => {
+                            // One dead page means silently stale data, so
+                            // restart the whole set.
+                            debug!("Page {} ended, reconnecting", page);
+                            app.lock().await.connection = ConnectionState::Connecting;
+                            notify.notify_one();
+                            if !backoff_or_reconnect(&mut backoff, update_count, &mut reconnect_rx).await {
+                                debug!("Reconnect signalled during backoff");
+                            }
+                            break;
+                        }
+                        Some(PageEvent::Update(page, new_items, params)) => {
                             update_count += 1;
                             debug!("Received update #{} from page {}", update_count, page);
 
-                            let mut app = app.lock().await;
+                            per_page.insert(page, new_items);
 
-                            let new_items = match app.content_type {
-                                ContentType::Departure => params.data.departures.unwrap_or_default(),
-                                ContentType::Arrival => params.data.arrivals.unwrap_or_default(),
-                            };
-
-                            let before = collected.len();
-                            for item in new_items {
-                                if !collected.iter().any(|i| i.id == item.id) {
-                                    collected.push(item);
+                            let mut merged: Vec<TrainItem> = Vec::new();
+                            let mut seen = std::collections::HashSet::new();
+                            let mut pages: Vec<_> = per_page.keys().copied().collect();
+                            pages.sort_unstable();
+                            for p in pages {
+                                for item in &per_page[&p] {
+                                    if seen.insert(item.id.clone()) {
+                                        merged.push(item.clone());
+                                    }
                                 }
                             }
-                            collected.sort_by(|a, b| a.scheduled.cmp(&b.scheduled));
-                            debug!("Merged items: {} -> {}", before, collected.len());
+                            merged.sort_by(|a, b| a.scheduled.cmp(&b.scheduled));
 
-                            app.items = collected.clone();
+                            let mut app = app.lock().await;
+                            debug!("Merged items: {} -> {}", app.items.len(), merged.len());
+                            app.items = merged;
 
                             // Re-sync the selected index from its id after the
                             // sort, so the detail view keeps tracking the right
@@ -205,15 +261,11 @@ pub async fn run_websocket(
                         }
                         None => {
                             // Every page socket closed; back off and reconnect.
-                            if update_count > 0 {
-                                backoff = Duration::from_secs(1);
-                            }
                             debug!(
-                                "All page channels closed after {} updates, reconnecting in {:?}",
-                                update_count, backoff
+                                "All page channels closed after {} updates, reconnecting",
+                                update_count
                             );
-                            tokio::time::sleep(backoff).await;
-                            backoff = (backoff * 2).min(Duration::from_secs(30));
+                            backoff_or_reconnect(&mut backoff, update_count, &mut reconnect_rx).await;
                             break;
                         }
                     }
@@ -224,6 +276,31 @@ pub async fn run_websocket(
                     break;
                 }
             }
+        }
+    }
+}
+
+/// Waits out the (jittered) backoff, but returns early with `false` if a
+/// manual reconnect arrives, so pressing R never has to wait for the delay.
+/// Returns `true` if the full delay elapsed.
+async fn backoff_or_reconnect(
+    backoff: &mut Duration,
+    update_count: usize,
+    reconnect_rx: &mut mpsc::Receiver<()>,
+) -> bool {
+    if update_count > 0 {
+        *backoff = Duration::from_secs(1);
+    }
+    let delay = jittered(*backoff);
+    debug!("Reconnecting in {:?}", delay);
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => {
+            *backoff = (*backoff * 2).min(MAX_BACKOFF);
+            true
+        }
+        _ = reconnect_rx.recv() => {
+            *backoff = Duration::from_secs(1);
+            false
         }
     }
 }
