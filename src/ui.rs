@@ -13,7 +13,10 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{calculate_delay, format_time, App, AppMode, ConnectionState, ContentType};
+use crate::app::{
+    calculate_delay, format_time, App, AppMode, ConnectionState, ContentType, LinkError,
+};
+use crate::lang::Tr;
 
 /// Map a delay (minutes) to its colour: green on time, yellow up to 5 min late,
 /// red beyond that.
@@ -33,6 +36,25 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         AppMode::StationSelect => render_station_select(f, app),
         AppMode::TrainDetail => render_train_detail(f, app),
         AppMode::Normal => render_main(f, app),
+    }
+}
+
+/// Human-readable, translated description of a connection problem. Reasons
+/// from the network stack are untranslated and truncated to stay on one line.
+fn describe_error(tr: &Tr, err: &LinkError) -> String {
+    let with_reason = |label: &str, reason: &str| {
+        let reason: String = reason.chars().take(50).collect();
+        if reason.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label} ({reason})")
+        }
+    };
+    match err {
+        LinkError::Connect(r) => with_reason(tr.err_connect, r),
+        LinkError::Closed(r) => with_reason(tr.err_closed, r),
+        LinkError::Timeout => tr.err_timeout.to_string(),
+        LinkError::Parse => tr.err_parse.to_string(),
     }
 }
 
@@ -228,10 +250,17 @@ fn render_main(f: &mut Frame, app: &mut App) {
         ConnectionState::Failed => (tr.connection_failed.to_string(), Color::Red),
     };
 
-    let status_text = vec![Line::from(vec![
+    let mut status_spans = vec![
         Span::styled(tr.last_update, Style::default().fg(Color::Gray)),
         Span::styled(update_text, Style::default().fg(update_color)),
-    ])];
+    ];
+    if let Some(err) = &app.last_error {
+        status_spans.push(Span::styled(
+            format!("  {}{}", tr.error_label, describe_error(tr, err)),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    let status_text = vec![Line::from(status_spans)];
 
     let status = Paragraph::new(status_text).block(
         Block::default()
@@ -874,5 +903,35 @@ mod tests {
         app.selected_train_index = Some(150);
         let out = render(&mut app, 140, 30);
         assert!(out.contains("Zug"));
+    }
+
+    #[test]
+    fn status_bar_shows_last_error_with_reason_in_both_languages() {
+        let mut app = loaded_app();
+        app.last_error = Some(LinkError::Connect("dns failure".into()));
+        let out = render(&mut app, 160, 40);
+        assert!(out.contains("Error: Cannot connect (dns failure)"), "{out}");
+
+        app.lang = Lang::De;
+        app.last_error = Some(LinkError::Timeout);
+        let out = render(&mut app, 160, 40);
+        assert!(out.contains("Fehler: Keine Daten empfangen"));
+
+        app.last_error = Some(LinkError::Parse);
+        assert!(render(&mut app, 160, 40).contains(Lang::De.tr().err_parse));
+        app.last_error = None;
+        assert!(!render(&mut app, 160, 40).contains(Lang::De.tr().error_label));
+    }
+
+    #[test]
+    fn error_reasons_are_truncated_to_one_line() {
+        let tr = Lang::En.tr();
+        let long = "x".repeat(500);
+        let text = describe_error(tr, &LinkError::Closed(long));
+        assert!(text.len() < 100, "{text}");
+        assert_eq!(
+            describe_error(tr, &LinkError::Closed(String::new())),
+            tr.err_closed
+        );
     }
 }

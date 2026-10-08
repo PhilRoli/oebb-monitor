@@ -155,6 +155,11 @@ pub struct Tr {
     pub connecting: &'static str,
     pub connected: &'static str,
     pub connection_failed: &'static str,
+    pub error_label: &'static str,
+    pub err_connect: &'static str,
+    pub err_closed: &'static str,
+    pub err_timeout: &'static str,
+    pub err_parse: &'static str,
     // Station picker
     pub select_station: &'static str,
     pub search: &'static str,
@@ -211,6 +216,11 @@ static DE: Tr = Tr {
     connecting: "Verbinde...",
     connected: "Verbunden",
     connection_failed: "Verbindung fehlgeschlagen",
+    error_label: "Fehler: ",
+    err_connect: "Verbindung nicht möglich",
+    err_closed: "Verbindung getrennt",
+    err_timeout: "Keine Daten empfangen",
+    err_parse: "Ungültige Serverdaten",
     select_station: "Station wählen",
     search: "Suche: ",
     stations: "Stationen",
@@ -264,6 +274,11 @@ static EN: Tr = Tr {
     connecting: "Connecting...",
     connected: "Connected",
     connection_failed: "Connection failed",
+    error_label: "Error: ",
+    err_connect: "Cannot connect",
+    err_closed: "Connection lost",
+    err_timeout: "No data received",
+    err_parse: "Invalid server data",
     select_station: "Select station",
     search: "Search: ",
     stations: "Stations",
@@ -386,6 +401,18 @@ mod tests {
         assert_ne!(DE.departures, EN.departures);
         assert!(!DE.departures.is_empty() && !EN.departures.is_empty());
         assert!(!DE.connection_failed.is_empty() && !EN.connection_failed.is_empty());
+        for tr in [&DE, &EN] {
+            for s in [
+                tr.error_label,
+                tr.err_connect,
+                tr.err_closed,
+                tr.err_timeout,
+                tr.err_parse,
+            ] {
+                assert!(!s.is_empty());
+            }
+        }
+        assert_ne!(DE.err_timeout, EN.err_timeout);
     }
 
     #[test]

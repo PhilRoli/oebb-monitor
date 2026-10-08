@@ -55,11 +55,54 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     Ok(())
 }
 
+const USAGE: &str = "\
+Usage: oebb-monitor [OPTIONS]
+
+Options:
+  -d, --debug    Write a debug log (see README for the location)
+  -V, --version  Print version and exit
+  -h, --help     Print this help and exit";
+
+/// What the command line asks the program to do.
+#[derive(Debug, PartialEq)]
+enum Cli {
+    Run,
+    Help,
+    Version,
+}
+
+/// Parse the arguments after the program name. `--debug` is consumed by the
+/// logger itself, so it only needs to be recognised here.
+fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
+    let mut cli = Cli::Run;
+    for arg in args {
+        match arg.as_str() {
+            "-d" | "--debug" => {}
+            "-h" | "--help" => cli = Cli::Help,
+            "-V" | "--version" if cli != Cli::Help => cli = Cli::Version,
+            "-V" | "--version" => {}
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(cli)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::args().any(|a| a == "--version" || a == "-V") {
-        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-        return Ok(());
+    match parse_args(std::env::args().skip(1)) {
+        Ok(Cli::Run) => {}
+        Ok(Cli::Help) => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Ok(Cli::Version) => {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Err(msg) => {
+            eprintln!("{msg}\n\n{USAGE}");
+            std::process::exit(2);
+        }
     }
 
     debug!("Application starting");
@@ -69,15 +112,17 @@ async fn main() -> Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
         original_hook(info);
     }));
 
     let mut terminal = setup_terminal()?;
     // Run the app, then always restore the terminal before propagating any error.
     let result = run(&mut terminal).await;
-    restore_terminal(&mut terminal)?;
-    result
+    let restored = restore_terminal(&mut terminal);
+    // The error from `run` is the interesting one; only report a failed
+    // restore if everything else went fine.
+    result.and(restored)
 }
 
 /// The main event loop: render, then wait for the next of three wake-ups —
@@ -141,7 +186,9 @@ fn toggle_language(app: &mut App) {
     debug!("Language toggled to {}", app.lang.code());
     // Tests must never overwrite the developer's real config file.
     #[cfg(not(test))]
-    config::save_language(app.lang);
+    if let Err(e) = config::save_language(app.lang) {
+        debug!("Could not save language: {}", e);
+    }
 }
 
 /// Apply a single key press to the app state, sending a reconnect signal when a
@@ -514,5 +561,51 @@ mod tests {
         }
         assert_eq!(h.reconnects(), 0);
         assert_eq!(h.app.lock().await.mode, AppMode::Normal);
+    }
+
+    fn args(list: &[&str]) -> Result<Cli, String> {
+        parse_args(list.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn no_args_runs() {
+        assert_eq!(args(&[]), Ok(Cli::Run));
+    }
+
+    #[test]
+    fn debug_flag_is_accepted_and_still_runs() {
+        assert_eq!(args(&["--debug"]), Ok(Cli::Run));
+        assert_eq!(args(&["-d"]), Ok(Cli::Run));
+    }
+
+    #[test]
+    fn help_and_version_flags() {
+        assert_eq!(args(&["-h"]), Ok(Cli::Help));
+        assert_eq!(args(&["--help"]), Ok(Cli::Help));
+        assert_eq!(args(&["-V"]), Ok(Cli::Version));
+        assert_eq!(args(&["--version"]), Ok(Cli::Version));
+        assert_eq!(args(&["-d", "--version"]), Ok(Cli::Version));
+    }
+
+    #[test]
+    fn help_wins_over_version_in_any_order() {
+        assert_eq!(args(&["--version", "--help"]), Ok(Cli::Help));
+        assert_eq!(args(&["--help", "--version"]), Ok(Cli::Help));
+    }
+
+    #[test]
+    fn unknown_arguments_are_rejected() {
+        assert_eq!(
+            args(&["--frobnicate"]),
+            Err("unknown argument: --frobnicate".to_string())
+        );
+        assert!(args(&["-d", "extra"]).is_err());
+    }
+
+    #[test]
+    fn usage_mentions_every_flag() {
+        for flag in ["--debug", "--version", "--help"] {
+            assert!(USAGE.contains(flag));
+        }
     }
 }

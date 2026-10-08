@@ -36,6 +36,19 @@ pub enum ConnectionState {
     Failed,
 }
 
+/// Why the live connection last had trouble, shown next to the status.
+#[derive(Clone, PartialEq, Debug)]
+pub enum LinkError {
+    /// The socket could not be opened (carries the underlying reason).
+    Connect(String),
+    /// The socket closed or errored after connecting.
+    Closed(String),
+    /// The socket went silent for too long.
+    Timeout,
+    /// A message from the server could not be parsed.
+    Parse,
+}
+
 /// The complete application state.
 pub struct App {
     pub content_type: ContentType,
@@ -45,6 +58,8 @@ pub struct App {
     pub special_notices: Vec<SpecialNotice>,
     pub last_update: Option<DateTime<Local>>,
     pub connection: ConnectionState,
+    /// Most recent connection problem; cleared by the next good update.
+    pub last_error: Option<LinkError>,
     pub mode: AppMode,
     pub stations: HashMap<String, String>,
     pub all_stations_sorted: Vec<(String, String)>,
@@ -71,6 +86,7 @@ impl App {
             special_notices: Vec::new(),
             last_update: None,
             connection: ConnectionState::Connecting,
+            last_error: None,
             mode: AppMode::Normal,
             stations: HashMap::new(),
             all_stations_sorted: Vec::new(),
@@ -95,6 +111,11 @@ impl App {
             debug!("Loaded {} stations from embedded data", app.stations.len());
         } else {
             debug!("Failed to parse embedded stations.json");
+        }
+
+        // Show the list's spelling of the default station, if present.
+        if let Some(name) = app.stations.get(&app.station_id) {
+            app.station_name = name.clone();
         }
 
         let mut sorted: Vec<(String, String)> = app
@@ -188,8 +209,24 @@ pub fn build_ws_url(station_id: &str, content_type: &ContentType, page: usize) -
     };
     format!(
         "wss://meine.oebb.at/abfahrtankunft/webdisplay/web_client/ws/?stationId={}&contentType={}&staticLayout=false&page={}&offset=0&ignoreIncident=false&expandAll=false",
-        station_id, content, page
+        encode_query_value(station_id),
+        content,
+        page
     )
+}
+
+/// Percent-encode everything except RFC 3986 unreserved characters, so a
+/// station id can never inject extra query parameters.
+fn encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Format an RFC 3339 timestamp as local `HH:MM`, or `"-"` if unparseable.
@@ -460,5 +497,27 @@ mod tests {
             formatted,
             format!("{:02}:{:02}", local.hour(), local.minute())
         );
+    }
+
+    #[test]
+    fn ws_url_encodes_station_id() {
+        let url = build_ws_url("1&contentType=arrival #x", &ContentType::Departure, 1);
+        assert!(url.contains("stationId=1%26contentType%3Darrival%20%23x&contentType=departure"));
+        assert_eq!(
+            url.matches("contentType=").count(),
+            1,
+            "no injected parameter"
+        );
+    }
+
+    #[test]
+    fn default_station_name_matches_station_list() {
+        let app = App::new();
+        assert_eq!(app.stations.get(&app.station_id), Some(&app.station_name));
+    }
+
+    #[test]
+    fn starts_without_error() {
+        assert_eq!(App::new().last_error, None);
     }
 }

@@ -42,19 +42,26 @@ fn load_language_from(path: &Path) -> Option<Lang> {
     parse_language(&std::fs::read_to_string(path).ok()?)
 }
 
-/// Persist the chosen language, best-effort (errors are ignored).
+/// Persist the chosen language. A missing config location is not an error
+/// (nothing to save to); I/O failures are returned for the caller to report.
 #[cfg_attr(test, allow(dead_code))]
-pub fn save_language(lang: Lang) {
-    if let Some(path) = config_path() {
-        let _ = save_language_to(&path, lang);
+pub fn save_language(lang: Lang) -> std::io::Result<()> {
+    match config_path() {
+        Some(path) => save_language_to(&path, lang),
+        None => Ok(()),
     }
 }
 
+/// Write via a temp file + rename so a crash can't leave a truncated config.
 fn save_language_to(path: &Path, lang: Lang) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, format!("language = {}\n", lang.code()))
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, format!("language = {}\n", lang.code()))?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 #[cfg(test)]
@@ -120,5 +127,33 @@ mod tests {
         assert_eq!(load_language_from(&path), Some(Lang::En));
         save_language_to(&path, Lang::De).unwrap();
         assert_eq!(load_language_from(&path), Some(Lang::De));
+    }
+
+    #[test]
+    fn save_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        save_language_to(&path, Lang::En).unwrap();
+        save_language_to(&path, Lang::De).unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["config"]);
+    }
+
+    #[test]
+    fn save_reports_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // The target path is a directory, so the rename must fail...
+        let path = dir.path().join("config");
+        std::fs::create_dir(&path).unwrap();
+        assert!(save_language_to(&path, Lang::En).is_err());
+        // ...and the temp file is cleaned up again.
+        assert!(!path.with_extension("tmp").exists());
+        // A parent that is a file cannot be created either.
+        let file = dir.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(save_language_to(&file.join("sub").join("config"), Lang::En).is_err());
     }
 }

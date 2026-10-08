@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
-use crate::app::{build_ws_url, App, ConnectionState, ContentType};
+use crate::app::{build_ws_url, App, ConnectionState, ContentType, LinkError};
 use crate::model::{TrainItem, UpdateParams, WsMessage};
 
 /// How long a page socket may stay silent before it is considered dead.
@@ -18,9 +18,11 @@ enum PageEvent {
     /// The page's socket connected successfully.
     Connected,
     /// The page failed to connect at all.
-    Failed,
+    Failed(LinkError),
     /// A connected page socket closed, errored or went silent.
-    Ended(usize),
+    Ended(usize, LinkError),
+    /// The page received a message that could not be parsed.
+    Invalid,
     /// The page delivered a fresh `update` payload, already narrowed to the
     /// items of the content type its socket was opened for.
     Update(usize, Vec<TrainItem>, UpdateParams),
@@ -47,8 +49,22 @@ fn jittered(base: Duration) -> Duration {
 /// redraw without busy-polling.
 pub async fn run_websocket(
     app: Arc<Mutex<App>>,
+    reconnect_rx: mpsc::Receiver<()>,
+    notify: Arc<Notify>,
+) -> Result<()> {
+    run_websocket_with(app, reconnect_rx, notify, Arc::new(build_ws_url)).await
+}
+
+/// Builds the URL of one page: `(station_id, content_type, page)`.
+type UrlBuilder = Arc<dyn Fn(&str, &ContentType, usize) -> String + Send + Sync>;
+
+/// [`run_websocket`] with an injectable URL builder, so tests can point the
+/// whole loop at a local server.
+async fn run_websocket_with(
+    app: Arc<Mutex<App>>,
     mut reconnect_rx: mpsc::Receiver<()>,
     notify: Arc<Notify>,
+    url_for: UrlBuilder,
 ) -> Result<()> {
     debug!("WebSocket handler started");
     let mut active_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -104,7 +120,7 @@ pub async fn run_websocket(
         let (page_tx, mut page_rx) = mpsc::channel(100);
 
         for page in 1..=max_pages {
-            let url = build_ws_url(&station_id, &content_type, page);
+            let url = url_for(&station_id, &content_type, page);
             debug!("Spawning task for page {}: {}", page, url);
             let tx = page_tx.clone();
             let page_type = content_type.clone();
@@ -132,19 +148,29 @@ pub async fn run_websocket(
                             app.lock().await.connection = ConnectionState::Connected;
                             notify.notify_one();
                         }
-                        Some(PageEvent::Failed) => {
+                        Some(PageEvent::Failed(err)) => {
                             failed_count += 1;
+                            let mut app = app.lock().await;
+                            app.last_error = Some(err);
                             if failed_count >= max_pages && !connected_any {
                                 debug!("All {} pages failed to connect", max_pages);
-                                app.lock().await.connection = ConnectionState::Failed;
-                                notify.notify_one();
+                                app.connection = ConnectionState::Failed;
                             }
+                            notify.notify_one();
                         }
-                        Some(PageEvent::Ended(page)) => {
+                        Some(PageEvent::Invalid) => {
+                            app.lock().await.last_error = Some(LinkError::Parse);
+                            notify.notify_one();
+                        }
+                        Some(PageEvent::Ended(page, err)) => {
                             // One dead page means silently stale data, so
                             // restart the whole set.
-                            debug!("Page {} ended, reconnecting", page);
-                            app.lock().await.connection = ConnectionState::Connecting;
+                            debug!("Page {} ended ({:?}), reconnecting", page, err);
+                            {
+                                let mut app = app.lock().await;
+                                app.connection = ConnectionState::Connecting;
+                                app.last_error = Some(err);
+                            }
                             notify.notify_one();
                             if !backoff_or_reconnect(&mut backoff, update_count, &mut reconnect_rx).await {
                                 debug!("Reconnect signalled during backoff");
@@ -175,6 +201,7 @@ pub async fn run_websocket(
                                 app.special_notices = notices;
                             }
                             app.last_update = Some(Local::now());
+                            app.last_error = None;
                             app.connection = ConnectionState::Connected;
                             notify.notify_one();
                         }
@@ -238,7 +265,9 @@ async fn run_page(
         Ok((ws_stream, _)) => ws_stream,
         Err(e) => {
             debug!("Page {} failed to connect: {}", page, e);
-            let _ = tx.send(PageEvent::Failed).await;
+            let _ = tx
+                .send(PageEvent::Failed(LinkError::Connect(e.to_string())))
+                .await;
             return;
         }
     };
@@ -246,14 +275,13 @@ async fn run_page(
     let _ = tx.send(PageEvent::Connected).await;
     let (mut write, mut read) = ws_stream.split();
     let mut msg_count = 0;
-
-    loop {
+    let end = loop {
         let msg = match tokio::time::timeout(read_timeout, read.next()).await {
             Ok(Some(msg)) => msg,
-            Ok(None) => break,
+            Ok(None) => break LinkError::Closed(String::new()),
             Err(_) => {
                 debug!("Page {} timed out after {:?}", page, read_timeout);
-                break;
+                break LinkError::Timeout;
             }
         };
         match msg {
@@ -269,27 +297,30 @@ async fn run_page(
                         }
                     }
                     Ok(_) => {}
-                    Err(_) => debug!("Page {} failed to parse message", page),
+                    Err(_) => {
+                        debug!("Page {} failed to parse message", page);
+                        let _ = tx.send(PageEvent::Invalid).await;
+                    }
                 }
             }
             Ok(Message::Ping(payload)) => {
-                if write.send(Message::Pong(payload)).await.is_err() {
-                    break;
+                if let Err(e) = write.send(Message::Pong(payload)).await {
+                    break LinkError::Closed(e.to_string());
                 }
             }
             Ok(Message::Close(reason)) => {
                 debug!("Page {} WebSocket closed: {:?}", page, reason);
-                break;
+                break LinkError::Closed(String::new());
             }
             Err(e) => {
                 debug!("Page {} WebSocket error: {}", page, e);
-                break;
+                break LinkError::Closed(e.to_string());
             }
             _ => {}
         }
-    }
+    };
     debug!("Page {} task ending after {} messages", page, msg_count);
-    let _ = tx.send(PageEvent::Ended(page)).await;
+    let _ = tx.send(PageEvent::Ended(page, end)).await;
 }
 
 /// Waits out the (jittered) backoff, but returns early with `false` if a
@@ -484,6 +515,7 @@ mod tests {
         ));
 
         assert!(matches!(next_event(&mut rx).await, PageEvent::Connected));
+        assert!(matches!(next_event(&mut rx).await, PageEvent::Invalid));
         match next_event(&mut rx).await {
             PageEvent::Update(page, items, params) => {
                 assert_eq!(page, 3);
@@ -492,7 +524,10 @@ mod tests {
             }
             _ => panic!("expected Update"),
         }
-        assert!(matches!(next_event(&mut rx).await, PageEvent::Ended(3)));
+        assert!(matches!(
+            next_event(&mut rx).await,
+            PageEvent::Ended(3, LinkError::Closed(_))
+        ));
     }
 
     #[tokio::test]
@@ -555,7 +590,7 @@ mod tests {
             .unwrap();
         assert_eq!(payload, b"hello");
         // Drain until the page ends so the task finishes cleanly.
-        while !matches!(next_event(&mut rx).await, PageEvent::Ended(_)) {}
+        while !matches!(next_event(&mut rx).await, PageEvent::Ended(..)) {}
     }
 
     #[tokio::test]
@@ -576,7 +611,10 @@ mod tests {
         ));
 
         assert!(matches!(next_event(&mut rx).await, PageEvent::Connected));
-        assert!(matches!(next_event(&mut rx).await, PageEvent::Ended(2)));
+        assert!(matches!(
+            next_event(&mut rx).await,
+            PageEvent::Ended(2, LinkError::Timeout)
+        ));
     }
 
     #[tokio::test]
@@ -594,6 +632,208 @@ mod tests {
             tx,
             Duration::from_secs(1),
         ));
-        assert!(matches!(next_event(&mut rx).await, PageEvent::Failed));
+        assert!(matches!(
+            next_event(&mut rx).await,
+            PageEvent::Failed(LinkError::Connect(_))
+        ));
+    }
+
+    // ---- the whole loop against a local server ------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const DEPARTURES_CHANGED: &str = r#"{"method":"update","params":{"data":{"departures":[
+        {"id":"rj-65-20240101-1000","train":"RJX 65","scheduled":"2024-01-01T10:00:00+01:00",
+         "expected":"2024-01-01T10:25:00+01:00"}]}}}"#;
+
+    /// What the local server does with each accepted connection.
+    #[derive(Clone, Copy)]
+    enum Script {
+        /// Send the board for the requested content type, then idle.
+        Board,
+        /// Send the board, then replace it with a changed single-train board.
+        BoardThenChange,
+        /// Close immediately, but only for the first `n` connections.
+        DropFirst(usize),
+    }
+
+    /// Serve connections forever; returns the base URL and a connection counter.
+    async fn serve_loop(script: Script) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let nth = seen.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut uri = String::new();
+                    let ws = tokio_tungstenite::accept_hdr_async(
+                        stream,
+                        |req: &tokio_tungstenite::tungstenite::handshake::server::Request, resp| {
+                            uri = req.uri().to_string();
+                            Ok(resp)
+                        },
+                    )
+                    .await;
+                    let Ok(mut ws) = ws else { return };
+                    let board = if uri.contains("contentType=arrival") {
+                        ARRIVALS
+                    } else {
+                        DEPARTURES
+                    };
+                    match script {
+                        Script::DropFirst(n) if nth < n => {
+                            let _ = ws.close(None).await;
+                            return;
+                        }
+                        Script::BoardThenChange => {
+                            let _ = ws.send(Message::text(board)).await;
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                            let _ = ws.send(Message::text(DEPARTURES_CHANGED)).await;
+                        }
+                        _ => {
+                            let _ = ws.send(Message::text(board)).await;
+                        }
+                    }
+                    // Keep the connection open until the client goes away.
+                    while ws.next().await.is_some() {}
+                });
+            }
+        });
+        (format!("ws://{}", addr), count)
+    }
+
+    struct Loop {
+        app: Arc<Mutex<App>>,
+        reconnect: mpsc::Sender<()>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Loop {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn start_loop(base: String) -> Loop {
+        let mut app = App::new();
+        app.max_pages = 2;
+        let app = Arc::new(Mutex::new(app));
+        let (reconnect, rx) = mpsc::channel(10);
+        let url_for: UrlBuilder = Arc::new(move |_station, ct, page| {
+            let ct = match ct {
+                ContentType::Departure => "departure",
+                ContentType::Arrival => "arrival",
+            };
+            format!("{base}/?contentType={ct}&page={page}")
+        });
+        let task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                let _ = run_websocket_with(app, rx, Arc::new(Notify::new()), url_for).await;
+            }
+        });
+        Loop {
+            app,
+            reconnect,
+            task,
+        }
+    }
+
+    /// Poll the app state until `pred` holds, or fail after 10 seconds.
+    async fn wait_for(app: &Arc<Mutex<App>>, what: &str, pred: impl Fn(&App) -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if pred(&*app.lock().await) {
+                return;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_publishes_board_and_notices() {
+        let (base, count) = serve_loop(Script::Board).await;
+        let l = start_loop(base);
+        wait_for(&l.app, "items", |a| a.items.len() == 2).await;
+        let app = l.app.lock().await;
+        assert_eq!(app.connection, ConnectionState::Connected);
+        assert_eq!(app.special_notices.len(), 1);
+        assert!(app.last_update.is_some() && app.last_error.is_none());
+        assert_eq!(app.items[0].id, "rj-65-20240101-1000", "sorted by time");
+        drop(app);
+        assert_eq!(count.load(Ordering::SeqCst), 2, "one socket per page");
+    }
+
+    #[tokio::test]
+    async fn loop_applies_changes_to_trains_already_on_the_board() {
+        let (base, _) = serve_loop(Script::BoardThenChange).await;
+        let l = start_loop(base);
+        wait_for(&l.app, "initial board", |a| a.items.len() == 2).await;
+        wait_for(&l.app, "changed expected time", |a| {
+            a.items
+                .iter()
+                .any(|i| i.expected.as_deref() == Some("2024-01-01T10:25:00+01:00"))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn loop_switching_to_arrivals_replaces_the_board() {
+        let (base, _) = serve_loop(Script::Board).await;
+        let l = start_loop(base);
+        wait_for(&l.app, "departures", |a| a.items.len() == 2).await;
+
+        l.app.lock().await.content_type = ContentType::Arrival;
+        l.reconnect.send(()).await.unwrap();
+        wait_for(&l.app, "arrivals", |a| {
+            a.items.len() == 1 && a.items[0].id == "a1"
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn loop_reconnects_after_the_server_drops_it() {
+        // Both first connections (one per page) are closed straight away.
+        let (base, count) = serve_loop(Script::DropFirst(2)).await;
+        let l = start_loop(base);
+        wait_for(&l.app, "recovered board", |a| {
+            a.items.len() == 2 && a.connection == ConnectionState::Connected
+        })
+        .await;
+        assert!(count.load(Ordering::SeqCst) >= 4);
+        assert!(
+            l.app.lock().await.last_error.is_none(),
+            "cleared on success"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_reports_failed_when_nothing_is_listening() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let l = start_loop(format!("ws://{}", addr));
+        wait_for(&l.app, "failed state", |a| {
+            a.connection == ConnectionState::Failed
+                && matches!(a.last_error, Some(LinkError::Connect(_)))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn loop_manual_reconnect_opens_fresh_sockets() {
+        let (base, count) = serve_loop(Script::Board).await;
+        let l = start_loop(base);
+        wait_for(&l.app, "board", |a| a.items.len() == 2).await;
+        l.reconnect.send(()).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while count.load(Ordering::SeqCst) < 4 {
+            assert!(tokio::time::Instant::now() < deadline, "no new sockets");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
