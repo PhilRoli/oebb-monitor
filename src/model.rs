@@ -80,11 +80,25 @@ pub struct UpdateParams {
     pub data: TrainData,
 }
 
-/// A top-level WebSocket message. Only `method == "update"` carries board data.
+/// A top-level WebSocket message. Only `method == "update"` carries board data;
+/// the server also sends others (`loadUrl`, `keepAlive`, ...) whose `params`
+/// have different shapes, so `params` stays untyped until the method is known.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WsMessage {
     pub method: Option<String>,
-    pub params: Option<UpdateParams>,
+    pub params: Option<serde_json::Value>,
+}
+
+impl WsMessage {
+    /// `None` for every method other than `update`; for `update`, the typed
+    /// payload or the error explaining why it didn't match the expected shape.
+    pub fn into_update(self) -> Option<Result<UpdateParams, serde_json::Error>> {
+        if self.method.as_deref() != Some("update") {
+            return None;
+        }
+        let params = self.params.unwrap_or(serde_json::Value::Null);
+        Some(serde_json::from_value(params))
+    }
 }
 
 #[cfg(test)]
@@ -100,7 +114,7 @@ mod tests {
     fn parses_full_departure_payload() {
         let msg: WsMessage = serde_json::from_str(DEPARTURES).unwrap();
         assert_eq!(msg.method.as_deref(), Some("update"));
-        let data = msg.params.unwrap().data;
+        let data = msg.into_update().unwrap().unwrap().data;
         assert!(data.arrivals.is_none());
         let deps = data.departures.unwrap();
         assert_eq!(deps.len(), 2);
@@ -132,7 +146,7 @@ mod tests {
     #[test]
     fn minimal_train_only_needs_id_train_scheduled() {
         let msg: WsMessage = serde_json::from_str(DEPARTURES).unwrap();
-        let deps = msg.params.unwrap().data.departures.unwrap();
+        let deps = msg.into_update().unwrap().unwrap().data.departures.unwrap();
         let t = &deps[1];
         assert_eq!(t.train, "REX 1");
         assert!(t.expected.is_none() && t.destination.is_none() && t.formation.is_none());
@@ -141,7 +155,7 @@ mod tests {
     #[test]
     fn parses_arrival_payload() {
         let msg: WsMessage = serde_json::from_str(ARRIVALS).unwrap();
-        let data = msg.params.unwrap().data;
+        let data = msg.into_update().unwrap().unwrap().data;
         assert!(data.departures.is_none());
         assert!(data.special_notices.is_none());
         let arr = data.arrivals.unwrap();
@@ -153,12 +167,48 @@ mod tests {
         let msg: WsMessage = serde_json::from_str(NON_UPDATE).unwrap();
         assert_eq!(msg.method.as_deref(), Some("hello"));
         assert!(msg.params.is_none());
+        assert!(msg.into_update().is_none());
+    }
+
+    #[test]
+    fn real_non_update_messages_are_ignored_not_errors() {
+        // Captured from the live endpoint.
+        for raw in [
+            r#"{"jsonrpc":"2.0","method":"loadUrl","id":1,"params":{"urls":["departure-mobile"]}}"#,
+            r#"{"jsonrpc":"2.0","method":"keepAlive","params":{"timestamp":"2026-10-08T10:54:33.132Z"}}"#,
+        ] {
+            let msg: WsMessage = serde_json::from_str(raw).unwrap();
+            assert!(msg.into_update().is_none(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn update_with_wrong_shape_is_an_error() {
+        for raw in [
+            r#"{"method":"update"}"#,
+            r#"{"method":"update","params":{"urls":[]}}"#,
+            r#"{"method":"update","params":{"data":{"departures":"nope"}}}"#,
+        ] {
+            let msg: WsMessage = serde_json::from_str(raw).unwrap();
+            assert!(matches!(msg.into_update(), Some(Err(_))), "{raw}");
+        }
+    }
+
+    #[test]
+    fn update_ignores_jsonrpc_envelope_and_unknown_item_fields() {
+        let raw = r#"{"jsonrpc":"2.0","method":"update","id":2,"params":{"data":{"departures":[
+            {"id":"1634-PB","train":"1634","class":"S","availableAt":"-PT30M",
+             "scheduled":"2026-10-08T10:53:00Z","prioritizedVias":[]}]}}}"#;
+        let msg: WsMessage = serde_json::from_str(raw).unwrap();
+        let deps = msg.into_update().unwrap().unwrap().data.departures.unwrap();
+        assert_eq!(deps[0].id, "1634-PB");
     }
 
     #[test]
     fn missing_required_fields_is_an_error() {
         let bad = r#"{"method":"update","params":{"data":{"departures":[{"train":"X"}]}}}"#;
-        assert!(serde_json::from_str::<WsMessage>(bad).is_err());
+        let msg: WsMessage = serde_json::from_str(bad).unwrap();
+        assert!(matches!(msg.into_update(), Some(Err(_))));
     }
 
     #[test]

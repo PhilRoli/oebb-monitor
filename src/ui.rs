@@ -704,7 +704,8 @@ mod tests {
     fn loaded_app() -> App {
         let data = serde_json::from_str::<WsMessage>(FIXTURE)
             .unwrap()
-            .params
+            .into_update()
+            .unwrap()
             .unwrap()
             .data;
         let mut app = App::new();

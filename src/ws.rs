@@ -8,7 +8,8 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use crate::app::{build_ws_url, App, ConnectionState, ContentType, LinkError};
 use crate::model::{TrainItem, UpdateParams, WsMessage};
 
-/// How long a page socket may stay silent before it is considered dead.
+/// How long a page socket may stay silent before it is considered dead. The
+/// server sends something at least every ~30s (keepAlive/update).
 const READ_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -287,17 +288,16 @@ async fn run_page(
         match msg {
             Ok(Message::Text(text)) => {
                 msg_count += 1;
-                match serde_json::from_str::<WsMessage>(&text) {
-                    Ok(mut ws_msg) if ws_msg.method.as_deref() == Some("update") => {
-                        if let Some(mut params) = ws_msg.params.take() {
-                            // Narrow to the type this socket was opened for,
-                            // not whatever the UI has selected now.
-                            let items = extract_items(&mut params, &content_type);
-                            let _ = tx.send(PageEvent::Update(page, items, params)).await;
-                        }
+                match serde_json::from_str::<WsMessage>(&text).map(WsMessage::into_update) {
+                    Ok(Some(Ok(mut params))) => {
+                        // Narrow to the type this socket was opened for,
+                        // not whatever the UI has selected now.
+                        let items = extract_items(&mut params, &content_type);
+                        let _ = tx.send(PageEvent::Update(page, items, params)).await;
                     }
-                    Ok(_) => {}
-                    Err(_) => {
+                    // Other methods (loadUrl, keepAlive, ...) are expected noise.
+                    Ok(None) => {}
+                    Ok(Some(Err(_))) | Err(_) => {
                         debug!("Page {} failed to parse message", page);
                         let _ = tx.send(PageEvent::Invalid).await;
                     }
@@ -422,7 +422,7 @@ mod tests {
     #[test]
     fn extract_items_picks_requested_type_only() {
         let msg: WsMessage = serde_json::from_str(DEPARTURES).unwrap();
-        let mut params = msg.params.unwrap();
+        let mut params = msg.into_update().unwrap().unwrap();
         assert!(extract_items(&mut params, &ContentType::Arrival).is_empty());
         assert_eq!(extract_items(&mut params, &ContentType::Departure).len(), 2);
     }
@@ -835,5 +835,42 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "no new sockets");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Talks to the real ÖBB endpoint (TLS, handshake, payload shape).
+    /// Run with `cargo test -- --ignored live`.
+    #[tokio::test]
+    #[ignore = "needs network access to meine.oebb.at"]
+    async fn live_endpoint_delivers_a_departure_board() {
+        let url = build_ws_url("8101001", &ContentType::Departure, 1);
+        let (tx, mut rx) = mpsc::channel(10);
+        let task = tokio::spawn(run_page(
+            1,
+            url,
+            ContentType::Departure,
+            tx,
+            Duration::from_secs(20),
+        ));
+
+        let event = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("no event within 20s")
+            .unwrap();
+        assert!(
+            matches!(event, PageEvent::Connected),
+            "TLS/handshake failed"
+        );
+        loop {
+            match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
+                Ok(Some(PageEvent::Update(_, items, _))) => {
+                    assert!(!items.is_empty(), "empty departure board");
+                    break;
+                }
+                Ok(Some(PageEvent::Invalid)) => panic!("payload no longer parses"),
+                Ok(Some(_)) => {}
+                _ => panic!("no update within 20s"),
+            }
+        }
+        task.abort();
     }
 }

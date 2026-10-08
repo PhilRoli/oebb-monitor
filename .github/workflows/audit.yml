@@ -1,0 +1,27 @@
+name: Security audit
+
+# Separate from CI on purpose: an advisory in main's dependencies must not
+# block the Dependabot PR that fixes it.
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml, Cargo.lock]
+  schedule:
+    - cron: '17 5 * * 1' # Mondays
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      issues: write # lets the action open an issue for new advisories
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
