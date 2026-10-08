@@ -33,8 +33,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked
 
-  # Separate job (not a matrix) so the required "check" name used by the
-  # dependabot auto-merge workflow stays unchanged.
   macos:
     runs-on: macos-latest
     steps:
@@ -42,3 +40,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+
+  # Merge Dependabot PRs once every job above is green. Gating with `needs`
+  # replaces polling for the check from another workflow: no runner time is
+  # burnt waiting, and a failed or skipped job simply skips this one. main is
+  # deliberately not protected (the release job pushes to it), so this is the
+  # only gate. Merges made with GITHUB_TOKEN don't trigger the pull_request
+  # "closed" path in dependabot-release.yml, so dispatch it directly.
+  auto-merge:
+    needs: [check, macos, msrv]
+    if: github.event_name == 'pull_request' && github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      # Major bumps may break behaviour the tests can't see; leave them for review.
+      - if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr merge --squash "$PR_URL"
+          gh workflow run dependabot-release.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f pr_number="$PR_NUMBER"

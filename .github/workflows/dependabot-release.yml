@@ -1,58 +1,18 @@
-name: Dependabot auto-merge and release
+name: Dependabot release
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, closed]
+    types: [closed]
   workflow_dispatch:
     inputs:
       pr_number:
         description: Merged Dependabot PR to release for
         required: true
-      update_type:
-        description: Dependabot update type
-        default: version-update:semver-patch
-
-permissions:
-  contents: write
-  pull-requests: write
-  actions: write
 
 jobs:
-  auto-merge:
-    if: github.actor == 'dependabot[bot]' && github.event.action != 'closed'
-    runs-on: ubuntu-latest
-    steps:
-      - id: meta
-        uses: dependabot/fetch-metadata@v2
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-      # main is deliberately not protected (the release job must push to it), so wait for
-      # the CI "check" job here. Merges made with GITHUB_TOKEN don't trigger the
-      # pull_request-closed path below, so start the release directly after merging.
-      - if: steps.meta.outputs.update-type != 'version-update:semver-major'
-        run: |
-          for i in $(seq 1 90); do
-            state=$(gh pr view "$PR_URL" --json statusCheckRollup \
-              --jq '[.statusCheckRollup[] | select(.name == "check") | (.conclusion // .status)] | first // "MISSING"')
-            case "$state" in
-              SUCCESS)
-                gh pr merge --squash "$PR_URL"
-                gh workflow run dependabot-release.yml --repo "$GITHUB_REPOSITORY" --ref main \
-                  -f pr_number="$PR_NUMBER" -f update_type="${{ steps.meta.outputs.update-type }}"
-                exit 0 ;;
-              FAILURE|CANCELLED|TIMED_OUT) echo "CI check is $state, not merging."; exit 1 ;;
-            esac
-            sleep 20
-          done
-          echo "Timed out waiting for the CI check."; exit 1
-        env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   # Reached by dispatch (after an auto-merge) or when a Dependabot PR is merged by hand.
-  # A merged Dependabot PR that changed Cargo.toml/Cargo.lock ships a new version:
-  # major dependency bump -> 0.X+1.0, anything else -> 0.x.Y+1. Tags pushed with
+  # A merged Dependabot PR that changed Cargo.toml/Cargo.lock ships a new patch
+  # version (0.x.Y+1), whatever the kind of dependency bump. Tags pushed with
   # GITHUB_TOKEN don't start other workflows, so the release workflow is dispatched.
   release:
     if: >-
@@ -60,16 +20,14 @@ jobs:
       || (github.event.action == 'closed' && github.event.pull_request.merged == true
           && github.event.pull_request.user.login == 'dependabot[bot]')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      actions: write
     concurrency:
       group: release
       cancel-in-progress: false
     steps:
-      - id: meta
-        if: github.event_name == 'pull_request'
-        uses: dependabot/fetch-metadata@v2
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
       - uses: actions/checkout@v7
         with:
           ref: main
@@ -79,7 +37,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
-          UPDATE_TYPE: ${{ steps.meta.outputs.update-type || inputs.update_type }}
         run: |
           if ! gh pr diff "$PR_NUMBER" --name-only | grep -qE '^Cargo\.(toml|lock)$'; then
             echo "No Cargo changes in this PR, nothing to release."
@@ -88,19 +45,14 @@ jobs:
           fi
           current=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
           IFS=. read -r major minor patch <<< "$current"
-          if [ "$UPDATE_TYPE" = "version-update:semver-major" ]; then
-            minor=$((minor + 1)); patch=0
-          else
-            patch=$((patch + 1))
-          fi
-          next="$major.$minor.$patch"
+          next="$major.$minor.$((patch + 1))"
           if git ls-remote --exit-code --tags origin "v$next" >/dev/null 2>&1; then
             echo "Tag v$next already exists, not releasing." >&2
             exit 1
           fi
           echo "release=true" >> "$GITHUB_OUTPUT"
           echo "version=$next" >> "$GITHUB_OUTPUT"
-          echo "Releasing $current -> $next ($UPDATE_TYPE)"
+          echo "Releasing $current -> $next"
 
       - name: Bump version, tag and push
         if: steps.plan.outputs.release == 'true'
