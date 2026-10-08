@@ -658,6 +658,8 @@ mod tests {
     }
 
     /// Serve connections forever; returns the base URL and a connection counter.
+    // The handshake callback's error type is dictated by tungstenite.
+    #[allow(clippy::result_large_err)]
     async fn serve_loop(script: Script) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
