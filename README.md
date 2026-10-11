@@ -1,4 +1,4 @@
-# ÖBB Monitor
+# <img src="assets/icon.png" width="48" height="48" align="absmiddle" alt="ÖBB Monitor icon"> ÖBB Monitor
 
 Terminal UI for live ÖBB (Austrian Federal Railways) departure and arrival data, streamed via WebSocket.
 
