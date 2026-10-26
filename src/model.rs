@@ -34,6 +34,9 @@ pub struct TrainItem {
     pub prioritized_vias: Option<Vec<String>>,
     pub operator: Option<String>,
     pub formation: Option<Vec<Formation>>,
+    /// Markers such as `TRACKCHANGE` (departs from a different track than
+    /// planned) or `AIRPORT`.
+    pub flags: Option<Vec<String>>,
 }
 
 impl TrainItem {
@@ -65,6 +68,11 @@ impl TrainItem {
             .map(|stop| stop.replace("&#8203;", "").trim().to_string())
             .filter(|stop| !stop.is_empty())
             .collect()
+    }
+
+    /// Whether the train was moved to a different track than planned.
+    pub fn track_changed(&self) -> bool {
+        self.flags.iter().flatten().any(|f| f == "TRACKCHANGE")
     }
 }
 

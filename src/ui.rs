@@ -1,16 +1,17 @@
 //! All terminal rendering.
 //!
 //! [`ui`] dispatches to one of three screen renderers based on the current
-//! [`AppMode`]. Rendering is a pure function of [`App`] state; nothing here
+//! [`AppMode`], with the key help optionally drawn on top. Rendering is a pure function of [`App`] state; nothing here
 //! mutates application data beyond scroll state (the board, station list, and
 //! detail view offsets).
 //! All user-facing text comes from the active language's [`crate::lang::Tr`].
 
+use chrono::Local;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
     Frame,
 };
 
@@ -36,7 +37,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     match app.mode {
         AppMode::StationSelect => render_station_select(f, app),
         AppMode::TrainDetail => render_train_detail(f, app),
-        AppMode::Normal => render_main(f, app),
+        AppMode::Normal | AppMode::Filter => render_main(f, app),
+    }
+    if app.show_help {
+        render_help(f, app);
     }
 }
 
@@ -59,168 +63,356 @@ fn describe_error(tr: &Tr, err: &LinkError) -> String {
     }
 }
 
-/// The main board: title, the departures/arrivals table, station notices,
-/// and a status line with connection state and key hints.
+/// A board column. Narrow terminals drop the less important ones first.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Col {
+    Num,
+    Time,
+    Actual,
+    Delay,
+    Train,
+    Line,
+    /// Destination on the departure board, origin on the arrival board.
+    Place,
+    Track,
+    Sector,
+    Remarks,
+}
+
+impl Col {
+    const ALL: [Col; 10] = [
+        Col::Num,
+        Col::Time,
+        Col::Actual,
+        Col::Delay,
+        Col::Train,
+        Col::Line,
+        Col::Place,
+        Col::Track,
+        Col::Sector,
+        Col::Remarks,
+    ];
+
+    /// Dropped in this order until the rest fit; Time, Delay, Train, Place
+    /// and Track always stay.
+    const DROP_ORDER: [Col; 5] = [Col::Sector, Col::Actual, Col::Num, Col::Line, Col::Remarks];
+
+    /// The narrowest this column may get.
+    fn min_width(self) -> u16 {
+        match self {
+            Col::Num => 3,
+            Col::Time | Col::Actual => 6,
+            Col::Delay | Col::Train | Col::Line | Col::Sector => 8,
+            Col::Track => 7,
+            Col::Place | Col::Remarks => 15,
+        }
+    }
+}
+
+/// Widest the destination/origin column grows to before the rest goes to
+/// the remarks.
+const PLACE_MAX_WIDTH: u16 = 25;
+
+/// Total width of `cols` at their minimum, including the 1-cell spacing.
+fn min_table_width(cols: &[Col]) -> u16 {
+    cols.iter().map(|c| c.min_width()).sum::<u16>() + cols.len().saturating_sub(1) as u16
+}
+
+/// The columns that fit in `width`, in display order.
+fn board_columns(width: u16) -> Vec<Col> {
+    let mut cols = Col::ALL.to_vec();
+    for drop in Col::DROP_ORDER {
+        if min_table_width(&cols) <= width {
+            break;
+        }
+        cols.retain(|c| *c != drop);
+    }
+    cols
+}
+
+/// Whether the user asked for no colour (<https://no-color.org>). crossterm
+/// already strips the colours; this is for styles that must then switch to
+/// another way of standing out.
+fn no_color() -> bool {
+    std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
+}
+
+/// Background of the selected row or list entry; reverse video without colour.
+fn selection_style() -> Style {
+    if no_color() {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default().bg(Color::DarkGray)
+    }
+}
+
+/// Style of a track number: reversed (so it reads even without colour) when
+/// the train was moved to a different track than planned.
+fn track_style(changed: bool) -> Style {
+    let style = Style::default().fg(Color::Magenta);
+    if changed {
+        style.add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
+/// How long ago the last update arrived, e.g. "vor 12 s" / "3 min ago".
+fn format_age(tr: &Tr, secs: i64) -> String {
+    let amount = match secs.max(0) {
+        s if s < 60 => format!("{s} s"),
+        s => format!("{} {}", s / 60, tr.min),
+    };
+    format!("{}{}{}", tr.ago_prefix, amount, tr.ago_suffix)
+}
+
+/// The feed pushes an update about every 30 s, so after three missed ones the
+/// age turns yellow, and red beyond twice that.
+const STALE_AFTER_SECS: i64 = 90;
+
+/// Colour for an update age: fresh, getting stale, or stale.
+fn age_color(secs: i64) -> Color {
+    if secs > 2 * STALE_AFTER_SECS {
+        Color::Red
+    } else if secs > STALE_AFTER_SECS {
+        Color::Yellow
+    } else {
+        Color::White
+    }
+}
+
+/// The main board: title with clock, the departures/arrivals table, station
+/// notices (only when there are any), and a status line with connection state
+/// and key hints.
 fn render_main(f: &mut Frame, app: &mut App) {
     let tr = app.lang.tr();
+    let area = f.area();
+
+    // Notices get as many lines as they need, up to a third of the screen,
+    // and no space at all when there are none.
+    let notices_text: Vec<Line> = app
+        .special_notices
+        .iter()
+        .flat_map(|notice| {
+            // Notice text carries embedded newlines; ratatui does not break a
+            // Line on them, so split here and indent the continuation lines.
+            notice
+                .text
+                .default
+                .split('\n')
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .enumerate()
+                .map(|(i, l)| Line::from(format!("{} {}", if i == 0 { "•" } else { " " }, l)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    // No trimming, so the continuation lines keep their indent.
+    let notices = Paragraph::new(notices_text)
+        .style(Style::default().fg(Color::Yellow))
+        .wrap(Wrap { trim: false });
+    let notices_height = if app.special_notices.is_empty() {
+        0
+    } else {
+        let lines = notices.line_count(area.width.saturating_sub(2)) as u16;
+        lines.saturating_add(2).min((area.height / 3).max(3))
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(5),
+            Constraint::Min(5),
+            Constraint::Length(notices_height),
             Constraint::Length(3),
         ])
-        .split(f.area());
+        .split(area);
 
-    let title_text = match app.content_type {
-        ContentType::Departure => format!("🚂 {} - {}", tr.departures, app.station_name),
-        ContentType::Arrival => format!("🚂 {} - {}", tr.arrivals, app.station_name),
-    };
+    render_title(f, app, chunks[0]);
+    render_board(f, app, chunks[1]);
 
-    let title = Paragraph::new(title_text)
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL));
-    f.render_widget(title, chunks[0]);
-
-    let header_cells: Vec<Cell> = [
-        "#",
-        tr.col_time,
-        tr.col_actual,
-        tr.col_delay,
-        tr.col_train,
-        tr.col_line,
-        if app.content_type == ContentType::Departure {
-            tr.col_dest
+    if notices_height > 0 {
+        let title = if app.special_notices.len() > 1 {
+            format!("{} ({})", tr.block_notices, app.special_notices.len())
         } else {
-            tr.col_from
-        },
-        tr.col_track,
-        tr.col_sector,
-        tr.col_remarks,
-    ]
-    .iter()
-    .map(|h| {
-        Cell::from(*h).style(
+            tr.block_notices.to_string()
+        };
+        let notices = notices.block(Block::default().borders(Borders::ALL).title(title));
+        f.render_widget(notices, chunks[2]);
+    }
+
+    render_status(f, app, chunks[3]);
+}
+
+/// Board name and station, centred, with the current time on the right like
+/// the clock on a station display.
+fn render_title(f: &mut Frame, app: &App, area: Rect) {
+    let tr = app.lang.tr();
+    let board = match app.content_type {
+        ContentType::Departure => tr.departures,
+        ContentType::Arrival => tr.arrivals,
+    };
+    let title = Line::from(format!("🚂 {} - {}", board, app.station_name));
+    let title_width = title.width() as u16;
+
+    let block = Block::default().borders(Borders::ALL);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(
+        Paragraph::new(title)
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .alignment(Alignment::Center),
+        inner,
+    );
+
+    // Only where it can't collide with the centred title.
+    let clock = Local::now().format("%H:%M").to_string();
+    let clock_width = clock.len() as u16 + 1;
+    if inner.width >= title_width + 2 * clock_width {
+        f.render_widget(
+            Paragraph::new(clock)
+                .style(Style::default().add_modifier(Modifier::BOLD))
+                .alignment(Alignment::Right),
+            inner,
+        );
+    }
+}
+
+/// The departures/arrivals table, filtered and scrolled to the selection.
+fn render_board(f: &mut Frame, app: &mut App, area: Rect) {
+    let tr = app.lang.tr();
+    let editing = app.mode == AppMode::Filter;
+
+    let mut block_title = tr.block_trains.to_string();
+    if editing || !app.filter.is_empty() {
+        block_title = format!(
+            "{} · {}: {}{} ({}/{})",
+            block_title,
+            tr.filter_label,
+            app.filter,
+            if editing { "_" } else { "" },
+            app.visible_items().len(),
+            app.items.len()
+        );
+    }
+    let block = Block::default().borders(Borders::ALL).title(block_title);
+    let cols = board_columns(block.inner(area).width);
+
+    let header = Row::new(cols.iter().map(|col| {
+        let text = match col {
+            Col::Num => "#",
+            Col::Time => tr.col_time,
+            Col::Actual => tr.col_actual,
+            Col::Delay => tr.col_delay,
+            Col::Train => tr.col_train,
+            Col::Line => tr.col_line,
+            Col::Place => match app.content_type {
+                ContentType::Departure => tr.col_dest,
+                ContentType::Arrival => tr.col_from,
+            },
+            Col::Track => tr.col_track,
+            Col::Sector => tr.col_sector,
+            Col::Remarks => tr.col_remarks,
+        };
+        Cell::from(text).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )
-    })
-    .collect();
+    }))
+    .height(1)
+    .bottom_margin(1);
 
-    let header = Row::new(header_cells).height(1).bottom_margin(1);
-
-    let rows = app.items.iter().enumerate().map(|(idx, item)| {
-        let scheduled_time = format_time(&item.scheduled);
-
-        let (actual_time, delay_str, delay_col) = if let Some(delay) = calculate_delay(item) {
-            let actual = item
-                .expected
-                .as_ref()
-                .map(|e| format_time(e))
-                .unwrap_or_else(|| "-".to_string());
-            let delay_text = if delay > 0 {
-                format!("+{}", delay)
+    let rows: Vec<Row> = app
+        .visible_items()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let is_selected = app.selected_train_index == Some(idx);
+            let delay = calculate_delay(item);
+            let cells = cols.iter().map(|col| match col {
+                Col::Num => {
+                    let number = match idx {
+                        0..=8 => format!("{}", idx + 1),
+                        9 => "0".to_string(),
+                        _ => " ".to_string(),
+                    };
+                    Cell::from(number).style(if is_selected {
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    })
+                }
+                Col::Time => Cell::from(format_time(&item.scheduled)),
+                Col::Actual => Cell::from(match (delay, &item.expected) {
+                    (Some(_), Some(expected)) => format_time(expected),
+                    _ => "-".to_string(),
+                }),
+                Col::Delay => match delay {
+                    Some(d) if d > 0 => {
+                        Cell::from(format!("+{d}")).style(Style::default().fg(delay_color(d)))
+                    }
+                    Some(d) => Cell::from(d.to_string()).style(Style::default().fg(delay_color(d))),
+                    None => Cell::from("-").style(Style::default().fg(Color::Gray)),
+                },
+                Col::Train => Cell::from(item.train.clone()),
+                Col::Line => Cell::from(
+                    item.line
+                        .clone()
+                        .or_else(|| item.product.clone())
+                        .unwrap_or_default(),
+                )
+                .style(Style::default().fg(Color::Cyan)),
+                Col::Place => Cell::from(
+                    match app.content_type {
+                        ContentType::Departure => item.destination.as_ref(),
+                        ContentType::Arrival => item.origin.as_ref(),
+                    }
+                    .map(|d| d.default.clone())
+                    .unwrap_or_else(|| "N/A".to_string()),
+                ),
+                Col::Track => Cell::from(item.track.clone().unwrap_or_else(|| "-".to_string()))
+                    .style(track_style(item.track_changed())),
+                Col::Sector => Cell::from(item.sector.clone().unwrap_or_else(|| "-".to_string())),
+                Col::Remarks => Cell::from(
+                    item.remarks
+                        .as_ref()
+                        .and_then(|r| r.first())
+                        // Remark text can contain embedded newlines; flatten
+                        // to a space so it stays on the single-height row.
+                        .map(|r| r.text.default.replace('\n', " "))
+                        .unwrap_or_default(),
+                ),
+            });
+            let row = Row::new(cells);
+            if is_selected {
+                row.style(selection_style())
             } else {
-                delay.to_string()
-            };
-            (actual, delay_text, delay_color(delay))
-        } else {
-            ("-".to_string(), "-".to_string(), Color::Gray)
-        };
+                row
+            }
+        })
+        .collect();
 
-        let train = item.train.clone();
-        let line = item
-            .line
-            .clone()
-            .or_else(|| item.product.clone())
-            .unwrap_or_default();
-
-        let dest = match app.content_type {
-            ContentType::Departure => item
-                .destination
-                .as_ref()
-                .map(|d| d.default.clone())
-                .unwrap_or_else(|| "N/A".to_string()),
-            ContentType::Arrival => item
-                .origin
-                .as_ref()
-                .map(|o| o.default.clone())
-                .unwrap_or_else(|| "N/A".to_string()),
-        };
-
-        let track = item.track.clone().unwrap_or_else(|| "-".to_string());
-        let sector = item.sector.clone().unwrap_or_else(|| "-".to_string());
-        let remarks = item
-            .remarks
-            .as_ref()
-            .and_then(|r| r.first())
-            // Remark text can contain embedded newlines; flatten to a space so
-            // it stays on the single-height table row.
-            .map(|r| r.text.default.replace('\n', " "))
-            .unwrap_or_default();
-
-        let number_str = match idx {
-            0..=8 => format!("{}", idx + 1),
-            9 => "0".to_string(),
-            _ => " ".to_string(),
-        };
-        let is_selected = app.selected_train_index == Some(idx);
-
-        let mut row = Row::new(vec![
-            Cell::from(number_str).style(if is_selected {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            }),
-            Cell::from(scheduled_time),
-            Cell::from(actual_time),
-            Cell::from(delay_str).style(Style::default().fg(delay_col)),
-            Cell::from(train),
-            Cell::from(line).style(Style::default().fg(Color::Cyan)),
-            Cell::from(dest),
-            Cell::from(track).style(Style::default().fg(Color::Magenta)),
-            Cell::from(sector),
-            Cell::from(remarks),
-        ]);
-
-        if is_selected {
-            row = row.style(Style::default().bg(Color::DarkGray));
+    // The destination grows up to its maximum, then the remarks take the rest.
+    let spare = block
+        .inner(area)
+        .width
+        .saturating_sub(min_table_width(&cols));
+    let widths = cols.iter().map(|col| match col {
+        Col::Place if cols.contains(&Col::Remarks) => {
+            Constraint::Length((col.min_width() + spare).min(PLACE_MAX_WIDTH))
         }
-
-        row
+        Col::Place | Col::Remarks => Constraint::Min(col.min_width()),
+        _ => Constraint::Length(col.min_width()),
     });
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(3),
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Length(25),
-            Constraint::Length(7),
-            Constraint::Length(8),
-            Constraint::Min(15),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(tr.block_trains),
-    );
+    let table = Table::new(rows, widths).header(header).block(block);
 
     // The table scrolls to keep the selection visible; with no selection it
     // returns to the top rather than staying wherever it last scrolled to.
@@ -228,29 +420,20 @@ fn render_main(f: &mut Frame, app: &mut App) {
     if app.selected_train_index.is_none() {
         *app.board_state.offset_mut() = 0;
     }
-    f.render_stateful_widget(table, chunks[1], &mut app.board_state);
+    f.render_stateful_widget(table, area, &mut app.board_state);
+}
 
-    // Ratatui's Paragraph wraps for us (correctly accounting for character
-    // width), so we just emit one bullet line per notice and let it flow.
-    let notices_text: Vec<Line> = app
-        .special_notices
-        .iter()
-        .map(|notice| Line::from(format!("• {}", notice.text.default)))
-        .collect();
-
-    let notices = Paragraph::new(notices_text)
-        .style(Style::default().fg(Color::Yellow))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(tr.block_notices),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(notices, chunks[2]);
+/// Connection state and data age on the left; key hints on the right, as
+/// many as fit.
+fn render_status(f: &mut Frame, app: &App, area: Rect) {
+    let tr = app.lang.tr();
 
     let (update_text, update_color) = match &app.connection {
         ConnectionState::Connected => match app.last_update {
-            Some(t) => (t.format("%H:%M:%S").to_string(), Color::White),
+            Some(t) => {
+                let secs = (Local::now() - t).num_seconds();
+                (format_age(tr, secs), age_color(secs))
+            }
             None => (tr.connected.to_string(), Color::Green),
         },
         ConnectionState::Connecting => (tr.connecting.to_string(), Color::Yellow),
@@ -267,62 +450,135 @@ fn render_main(f: &mut Frame, app: &mut App) {
             Style::default().fg(Color::Red),
         ));
     }
-    let status_text = vec![Line::from(status_spans)];
+    let status_line = Line::from(status_spans);
+    let status_width = status_line.width() as u16;
 
-    let status = Paragraph::new(status_text).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(tr.block_status),
-    );
-    f.render_widget(status, chunks[3]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(tr.block_status);
+    let inner = block.inner(area);
+    f.render_widget(Paragraph::new(status_line).block(block), area);
 
-    let shortcuts_width = 64u16;
-    let shortcuts_x = chunks[3].x + chunks[3].width.saturating_sub(shortcuts_width + 2);
-    let shortcuts_y = chunks[3].y + 1;
-
-    if shortcuts_x > chunks[3].x {
-        let key = |s: &'static str| {
-            Span::styled(
-                s,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )
-        };
-        let shortcuts = Line::from(vec![
-            key("1-9,0"),
-            Span::raw("/"),
-            key("↑↓"),
-            Span::raw("+"),
-            key("Enter"),
-            Span::raw(format!(" {} ", tr.detail)),
-            key("[A]"),
-            Span::raw(format!("{} ", tr.hint_arr)),
-            key("[D]"),
-            Span::raw(format!("{} ", tr.hint_dep)),
-            key("[S]"),
-            Span::raw(format!("{} ", tr.hint_stn)),
-            key("[R]"),
-            Span::raw(format!("{} ", tr.hint_ref)),
-            key("[L]"),
-            Span::raw(format!("{} ", tr.hint_lang)),
-            Span::styled(
-                "[Q]",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(tr.hint_quit),
-        ]);
-
-        let shortcuts_area = Rect {
-            x: shortcuts_x,
-            y: shortcuts_y,
-            width: shortcuts_width,
-            height: 1,
-        };
-
-        let shortcuts_widget = Paragraph::new(shortcuts).alignment(Alignment::Right);
-        f.render_widget(shortcuts_widget, shortcuts_area);
+    // Pick the most complete hint line that fits beside the status text.
+    let available = inner.width.saturating_sub(status_width + 2);
+    let hints = key_hints(app)
+        .into_iter()
+        .find(|line| line.width() as u16 <= available);
+    if let Some(hints) = hints {
+        f.render_widget(Paragraph::new(hints).alignment(Alignment::Right), inner);
     }
+}
+
+/// Key hint lines for the status bar, most complete first.
+fn key_hints(app: &App) -> Vec<Line<'static>> {
+    let tr = app.lang.tr();
+    let key = |s: &'static str| {
+        Span::styled(
+            s,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let help = vec![key("[?]"), Span::raw(tr.hint_help)];
+
+    if app.mode == AppMode::Filter {
+        return vec![Line::from(Span::raw(tr.filter_help)), Line::from(help)];
+    }
+
+    let commands = vec![
+        key("[A]"),
+        Span::raw(format!("{} ", tr.hint_arr)),
+        key("[D]"),
+        Span::raw(format!("{} ", tr.hint_dep)),
+        key("[S]"),
+        Span::raw(format!("{} ", tr.hint_stn)),
+        key("[/]"),
+        Span::raw(format!("{} ", tr.hint_filter)),
+        key("[R]"),
+        Span::raw(format!("{} ", tr.hint_ref)),
+        key("[L]"),
+        Span::raw(format!("{} ", tr.hint_lang)),
+        key("[?]"),
+        Span::raw(format!("{} ", tr.hint_help)),
+        Span::styled(
+            "[Q]",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(tr.hint_quit),
+    ];
+    let mut full = vec![
+        key("1-9,0"),
+        Span::raw("/"),
+        key("↑↓"),
+        Span::raw("+"),
+        key("Enter"),
+        Span::raw(format!(" {} ", tr.detail)),
+    ];
+    full.extend(commands.clone());
+
+    vec![Line::from(full), Line::from(commands), Line::from(help)]
+}
+
+/// The key reference, drawn over whatever screen is open.
+fn render_help(f: &mut Frame, app: &App) {
+    let tr = app.lang.tr();
+
+    let key_width = tr
+        .help
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = Vec::new();
+    for (keys, action) in tr.help {
+        if keys.is_empty() {
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                *action,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {keys:key_width$}  "),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(*action),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        tr.help_close,
+        Style::default().fg(Color::Gray),
+    )));
+
+    // Just big enough for the content (plus border and padding), centred and
+    // clipped to the screen.
+    let screen = f.area();
+    let width = (lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4).min(screen.width);
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(tr.help_title)),
+        area,
+    );
 }
 
 /// The centred station-picker popup: search field, filtered list, key hints.
@@ -342,8 +598,7 @@ fn render_station_select(f: &mut Frame, app: &mut App) {
 
     let block = Block::default()
         .title(tr.select_station)
-        .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black));
+        .borders(Borders::ALL);
     f.render_widget(block, popup_area);
 
     let search_text = format!("{}{}_", tr.search, app.station_search);
@@ -352,11 +607,15 @@ fn render_station_select(f: &mut Frame, app: &mut App) {
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(search, chunks[0]);
 
+    // With an empty search the list opens with the recent stations, marked.
+    let mark_recent = app.station_search.is_empty();
     let items: Vec<ListItem> = app
         .filtered_stations
         .iter()
-        .enumerate()
-        .map(|(i, (_, name))| ListItem::new(format!("{:2}. {}", i + 1, name)))
+        .map(|(id, name)| {
+            let recent = mark_recent && app.recent_stations.contains(id);
+            ListItem::new(format!("{} {}", if recent { "↻" } else { " " }, name))
+        })
         .collect();
 
     let list_title = if app.total_filtered_count > app.filtered_stations.len() {
@@ -374,11 +633,7 @@ fn render_station_select(f: &mut Frame, app: &mut App) {
 
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(list_title))
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(selection_style().add_modifier(Modifier::BOLD))
         .highlight_symbol(">> ");
 
     f.render_stateful_widget(list, chunks[1], &mut app.station_list_state);
@@ -398,9 +653,11 @@ fn render_train_detail(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let popup_area = centered_rect(80, 85, area);
 
-    let train = app.selected_train_index.and_then(|idx| app.items.get(idx));
+    // Owned, so the scroll clamp below can update the app while the content
+    // is still borrowed from the train.
+    let train = app.selected_train().cloned();
 
-    if let Some(train) = train {
+    if let Some(train) = &train {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -410,9 +667,7 @@ fn render_train_detail(f: &mut Frame, app: &mut App) {
             ])
             .split(popup_area);
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .style(Style::default().bg(Color::Black));
+        let block = Block::default().borders(Borders::ALL);
         f.render_widget(block, popup_area);
 
         let line = train
@@ -420,13 +675,17 @@ fn render_train_detail(f: &mut Frame, app: &mut App) {
             .as_deref()
             .or(train.product.as_deref())
             .unwrap_or("?");
-        let dest = train
-            .destination
-            .as_ref()
-            .or(train.origin.as_ref())
-            .map(|d| d.default.as_str())
-            .unwrap_or("N/A");
-        let title_text = format!("🚂 {} {} - {} → {}", tr.train, train.train, line, dest);
+        // Where it goes on the departure board, where it comes from on the
+        // arrival board.
+        let (place, joiner) = match app.content_type {
+            ContentType::Departure => (train.destination.as_ref(), "→"),
+            ContentType::Arrival => (train.origin.as_ref(), tr.from_word),
+        };
+        let place = place.map(|d| d.default.as_str()).unwrap_or("N/A");
+        let title_text = format!(
+            "🚂 {} {} - {} {} {}",
+            tr.train, train.train, line, joiner, place
+        );
         let title = Paragraph::new(title_text)
             .style(
                 Style::default()
@@ -472,7 +731,7 @@ fn render_train_detail(f: &mut Frame, app: &mut App) {
                     format!("{}: ", tr.track),
                     Style::default().fg(Color::Yellow),
                 ),
-                Span::styled(track.clone(), Style::default().fg(Color::Magenta)),
+                Span::styled(track.clone(), track_style(train.track_changed())),
                 Span::raw(" "),
                 Span::styled(
                     train
@@ -481,6 +740,16 @@ fn render_train_detail(f: &mut Frame, app: &mut App) {
                         .map(|s| format!("{} {}", tr.sector, s))
                         .unwrap_or_default(),
                     Style::default().fg(Color::Magenta),
+                ),
+                Span::styled(
+                    if train.track_changed() {
+                        format!(" {}", tr.track_changed)
+                    } else {
+                        String::new()
+                    },
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]));
         }
@@ -944,6 +1213,155 @@ mod tests {
         assert!(render(&mut app, 160, 40).contains(Lang::De.tr().err_parse));
         app.last_error = None;
         assert!(!render(&mut app, 160, 40).contains(Lang::De.tr().error_label));
+    }
+
+    #[test]
+    fn notices_panel_only_appears_with_notices_and_splits_lines() {
+        let mut app = loaded_app();
+        let title = app.lang.tr().block_notices;
+        app.special_notices[0].text.default = "Bauarbeiten\nGrund: Gleisarbeiten".into();
+        let out = render(&mut app, 140, 40);
+        assert!(out.contains(title));
+        assert!(out.contains("• Bauarbeiten"), "{out}");
+        assert!(out.contains("  Grund: Gleisarbeiten"), "continuation line");
+
+        app.special_notices.clear();
+        assert!(!render(&mut app, 140, 40).contains(title));
+    }
+
+    #[test]
+    fn notices_panel_is_capped_at_a_third_of_the_screen() {
+        let mut app = loaded_app();
+        let notice = app.special_notices[0].clone();
+        app.special_notices = vec![notice; 30];
+        let out = render(&mut app, 140, 30);
+        assert!(out.contains("Notices (30)"));
+        assert!(out.contains("RJX 65"), "the board keeps its rows");
+    }
+
+    #[test]
+    fn changed_track_is_reversed_on_board_and_noted_in_detail() {
+        assert!(track_style(true).add_modifier.contains(Modifier::REVERSED));
+        assert!(!track_style(false).add_modifier.contains(Modifier::REVERSED));
+
+        let mut app = loaded_app();
+        app.items[0].flags = Some(vec!["TRACKCHANGE".into()]);
+        app.mode = AppMode::TrainDetail;
+        app.selected_train_index = Some(0);
+        assert!(render(&mut app, 140, 40).contains("(track changed)"));
+        app.items[0].flags = Some(vec!["AIRPORT".into()]);
+        assert!(!render(&mut app, 140, 40).contains("(track changed)"));
+    }
+
+    #[test]
+    fn narrow_boards_drop_the_least_important_columns() {
+        assert_eq!(board_columns(200), Col::ALL);
+        let at_80 = board_columns(78);
+        assert!(!at_80.contains(&Col::Sector) && !at_80.contains(&Col::Actual));
+        assert!(at_80.contains(&Col::Remarks));
+        assert!(min_table_width(&at_80) <= 78);
+        assert_eq!(
+            board_columns(10),
+            [Col::Time, Col::Delay, Col::Train, Col::Place, Col::Track]
+        );
+
+        let mut app = loaded_app();
+        let out = render(&mut app, 80, 30);
+        assert!(!out.contains("SECTOR"), "{out}");
+        assert!(out.contains("Salzburg Hbf") && out.contains("TRACK"));
+    }
+
+    #[test]
+    fn key_hints_shrink_to_fit_the_status_bar() {
+        let mut app = loaded_app();
+        let out = render(&mut app, 160, 40);
+        assert!(
+            out.contains("Enter Detail") && out.contains("[?]Help"),
+            "{out}"
+        );
+        let out = render(&mut app, 100, 40);
+        assert!(
+            !out.contains("Enter Detail") && out.contains("[A]rr"),
+            "{out}"
+        );
+        let out = render(&mut app, 60, 40);
+        assert!(!out.contains("[A]rr") && out.contains("[?]Help"), "{out}");
+    }
+
+    #[test]
+    fn help_overlay_draws_over_any_mode() {
+        for mode in [AppMode::Normal, AppMode::TrainDetail, AppMode::Filter] {
+            let mut app = loaded_app();
+            app.mode = mode;
+            app.selected_train_index = Some(0);
+            app.show_help = true;
+            let out = render(&mut app, 140, 50);
+            let tr = app.lang.tr();
+            assert!(out.contains(tr.help_title), "{out}");
+            assert!(out.contains("Toggle language"));
+            assert!(out.contains(tr.help_close));
+        }
+    }
+
+    #[test]
+    fn filter_shows_in_board_title_with_counts() {
+        let mut app = loaded_app();
+        app.mode = AppMode::Filter;
+        app.filter = "rjx".into();
+        let out = render(&mut app, 140, 40);
+        assert!(out.contains("Trains · Filter: rjx_ (1/2)"), "{out}");
+        assert!(out.contains(app.lang.tr().filter_help));
+        assert!(!out.contains("REX 1"));
+
+        app.mode = AppMode::Normal;
+        assert!(render(&mut app, 140, 40).contains("Filter: rjx (1/2)"));
+    }
+
+    #[test]
+    fn arrival_detail_title_names_the_origin() {
+        let mut app = loaded_app();
+        app.content_type = ContentType::Arrival;
+        app.mode = AppMode::TrainDetail;
+        app.selected_train_index = Some(0);
+        let out = render(&mut app, 140, 40);
+        assert!(out.contains("RJX from Wien Hbf"), "{out}");
+    }
+
+    #[test]
+    fn title_shows_the_clock_when_there_is_room() {
+        let mut app = loaded_app();
+        let clock = Local::now().format("%H:%M").to_string();
+        // The minute may tick over mid-test; accept the next one too.
+        let next = (Local::now() + chrono::Duration::minutes(1))
+            .format("%H:%M")
+            .to_string();
+        let out = render(&mut app, 140, 40);
+        assert!(out.contains(&clock) || out.contains(&next));
+    }
+
+    #[test]
+    fn update_age_is_relative_and_coloured_by_staleness() {
+        assert_eq!(format_age(Lang::En.tr(), 12), "12 s ago");
+        assert_eq!(format_age(Lang::De.tr(), 12), "vor 12 s");
+        assert_eq!(format_age(Lang::En.tr(), 185), "3 min ago");
+        assert_eq!(format_age(Lang::En.tr(), -4), "0 s ago", "clock skew");
+        assert_eq!(age_color(30), Color::White);
+        assert_eq!(age_color(STALE_AFTER_SECS + 1), Color::Yellow);
+        assert_eq!(age_color(2 * STALE_AFTER_SECS + 1), Color::Red);
+
+        let mut app = loaded_app();
+        app.last_update = Some(Local::now() - chrono::Duration::seconds(5));
+        assert!(render(&mut app, 140, 40).contains("s ago"));
+    }
+
+    #[test]
+    fn station_list_marks_recents_without_numbering() {
+        let mut app = loaded_app();
+        app.recent_stations = vec!["8101114".into()];
+        app.enter_station_select();
+        let out = render(&mut app, 120, 40);
+        assert!(out.contains("↻ Salzburg Hbf"), "{out}");
+        assert!(!out.contains(" 1. "));
     }
 
     #[test]

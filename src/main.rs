@@ -59,14 +59,23 @@ const USAGE: &str = "\
 Usage: oebb-monitor [OPTIONS]
 
 Options:
-  -d, --debug    Write a debug log (see README for the location)
-  -V, --version  Print version and exit
-  -h, --help     Print this help and exit";
+  -s, --station <NAME|ID>  Start at this station instead of the last one used
+  -a, --arrivals           Start with the arrivals board
+  -d, --debug              Write a debug log (see README for the location)
+  -V, --version            Print version and exit
+  -h, --help               Print this help and exit";
+
+/// Startup choices that override the saved config for this run.
+#[derive(Debug, Default, PartialEq)]
+struct RunOptions {
+    station: Option<String>,
+    arrivals: bool,
+}
 
 /// What the command line asks the program to do.
 #[derive(Debug, PartialEq)]
 enum Cli {
-    Run,
+    Run(RunOptions),
     Help,
     Version,
 }
@@ -74,23 +83,56 @@ enum Cli {
 /// Parse the arguments after the program name. `--debug` is consumed by the
 /// logger itself, so it only needs to be recognised here.
 fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
-    let mut cli = Cli::Run;
-    for arg in args {
+    let mut opts = RunOptions::default();
+    let mut help = false;
+    let mut version = false;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "-d" | "--debug" => {}
-            "-h" | "--help" => cli = Cli::Help,
-            "-V" | "--version" if cli != Cli::Help => cli = Cli::Version,
-            "-V" | "--version" => {}
-            other => return Err(format!("unknown argument: {other}")),
+            "-h" | "--help" => help = true,
+            "-V" | "--version" => version = true,
+            "-a" | "--arrivals" => opts.arrivals = true,
+            "-s" | "--station" => match args.next() {
+                Some(name) if !name.trim().is_empty() => opts.station = Some(name),
+                _ => return Err(format!("{arg} needs a station name or id")),
+            },
+            other => match other.strip_prefix("--station=") {
+                Some(name) if !name.trim().is_empty() => opts.station = Some(name.to_string()),
+                Some(_) => return Err("--station needs a station name or id".to_string()),
+                None => return Err(format!("unknown argument: {other}")),
+            },
         }
     }
-    Ok(cli)
+    Ok(if help {
+        Cli::Help
+    } else if version {
+        Cli::Version
+    } else {
+        Cli::Run(opts)
+    })
+}
+
+/// The starting state: saved config first, then command-line overrides.
+fn initial_app(opts: &RunOptions) -> Result<App, String> {
+    let mut app = App::new();
+    app.restore(&config::load());
+    if let Some(query) = &opts.station {
+        let id = app
+            .resolve_station(query)
+            .ok_or_else(|| format!("unknown station: {query}"))?;
+        app.set_station(&id);
+    }
+    if opts.arrivals {
+        app.content_type = ContentType::Arrival;
+    }
+    Ok(app)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    match parse_args(std::env::args().skip(1)) {
-        Ok(Cli::Run) => {}
+    let opts = match parse_args(std::env::args().skip(1)) {
+        Ok(Cli::Run(opts)) => opts,
         Ok(Cli::Help) => {
             println!("{USAGE}");
             return Ok(());
@@ -103,7 +145,14 @@ async fn main() -> Result<()> {
             eprintln!("{msg}\n\n{USAGE}");
             std::process::exit(2);
         }
-    }
+    };
+    let app = match initial_app(&opts) {
+        Ok(app) => app,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    };
 
     debug!("Application starting");
     debug!("Debug mode: {}", debug::DEBUG.enabled);
@@ -118,7 +167,7 @@ async fn main() -> Result<()> {
 
     let mut terminal = setup_terminal()?;
     // Run the app, then always restore the terminal before propagating any error.
-    let result = run(&mut terminal).await;
+    let result = run(&mut terminal, app).await;
     let restored = restore_terminal(&mut terminal);
     // The error from `run` is the interesting one; only report a failed
     // restore if everything else went fine.
@@ -128,8 +177,8 @@ async fn main() -> Result<()> {
 /// The main event loop: render, then wait for the next of three wake-ups —
 /// a key press, a state-change notification from the WebSocket task, or a
 /// periodic tick that keeps the status clock fresh.
-async fn run(terminal: &mut Tui) -> Result<()> {
-    let app = Arc::new(Mutex::new(App::new()));
+async fn run(terminal: &mut Tui, app: App) -> Result<()> {
+    let app = Arc::new(Mutex::new(app));
     let (reconnect_tx, reconnect_rx) = mpsc::channel(10);
     let notify = Arc::new(Notify::new());
 
@@ -180,21 +229,47 @@ async fn run(terminal: &mut Tui) -> Result<()> {
     Ok(())
 }
 
+/// Save the settings worth remembering for the next launch.
+fn persist(app: &App) {
+    // Tests must never overwrite the developer's real config file.
+    #[cfg(not(test))]
+    if let Err(e) = config::save(&app.to_config()) {
+        debug!("Could not save config: {}", e);
+    }
+    #[cfg(test)]
+    let _ = app;
+}
+
 /// Toggle the UI language and persist the choice for next launch.
 fn toggle_language(app: &mut App) {
     app.lang = app.lang.toggle();
+    app.lang_chosen = true;
     debug!("Language toggled to {}", app.lang.code());
-    // Tests must never overwrite the developer's real config file.
-    #[cfg(not(test))]
-    if let Err(e) = config::save_language(app.lang) {
-        debug!("Could not save language: {}", e);
+    persist(app);
+}
+
+/// Open the detail view for the visible train at `index`, if there is one.
+fn open_detail(app: &mut App, index: usize) {
+    if index < app.visible_items().len() {
+        debug!("Opening train detail at index {}", index);
+        app.select_index(index);
+        app.mode = AppMode::TrainDetail;
     }
 }
+
+/// Rows moved by PageUp/PageDown on the main board.
+const PAGE_ROWS: i32 = 10;
 
 /// Apply a single key press to the app state, sending a reconnect signal when a
 /// change requires re-fetching data. Returns `true` when the program should quit.
 async fn handle_key(app: &Arc<Mutex<App>>, reconnect_tx: &mpsc::Sender<()>, key: KeyEvent) -> bool {
     let mut app = app.lock().await;
+
+    // The help overlay sits on top of any mode; any key just closes it.
+    if app.show_help {
+        app.show_help = false;
+        return false;
+    }
 
     match app.mode {
         AppMode::Normal => match key.code {
@@ -205,12 +280,14 @@ async fn handle_key(app: &Arc<Mutex<App>>, reconnect_tx: &mpsc::Sender<()>, key:
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 debug!("Switching to Arrivals");
                 app.content_type = ContentType::Arrival;
+                persist(&app);
                 drop(app);
                 let _ = reconnect_tx.send(()).await;
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 debug!("Switching to Departures");
                 app.content_type = ContentType::Departure;
+                persist(&app);
                 drop(app);
                 let _ = reconnect_tx.send(()).await;
             }
@@ -226,36 +303,67 @@ async fn handle_key(app: &Arc<Mutex<App>>, reconnect_tx: &mpsc::Sender<()>, key:
             KeyCode::Char(c) if c.is_ascii_digit() => {
                 let digit = c.to_digit(10).unwrap() as usize;
                 let index = if digit == 0 { 9 } else { digit - 1 };
-                if index < app.items.len() {
-                    debug!("Selecting train at index {}", index);
-                    app.selected_train_index = Some(index);
-                    app.selected_train_id = app.items.get(index).map(|t| t.id.clone());
-                    app.detail_scroll = 0;
-                    app.mode = AppMode::TrainDetail;
-                }
+                open_detail(&mut app, index);
             }
             KeyCode::Char('l') | KeyCode::Char('L') => toggle_language(&mut app),
-            KeyCode::Up => app.select_relative(-1),
-            KeyCode::Down => app.select_relative(1),
+            KeyCode::Char('/') => {
+                debug!("Editing board filter");
+                app.mode = AppMode::Filter;
+            }
+            KeyCode::Char('?') => app.show_help = true,
+            KeyCode::Esc => {
+                // Peel back one layer: first the filter, then the selection.
+                if !app.filter.is_empty() {
+                    app.filter.clear();
+                    app.resync_selection();
+                } else {
+                    app.selected_train_index = None;
+                    app.selected_train_id = None;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => app.select_relative(-1),
+            KeyCode::Down | KeyCode::Char('j') => app.select_relative(1),
+            KeyCode::PageUp => app.select_relative(-PAGE_ROWS),
+            KeyCode::PageDown => app.select_relative(PAGE_ROWS),
+            KeyCode::Home | KeyCode::Char('g') => app.select_index(0),
+            KeyCode::End | KeyCode::Char('G') => app.select_last(),
             KeyCode::Enter => {
                 if let Some(idx) = app.selected_train_index {
-                    debug!("Opening train detail");
-                    app.selected_train_id = app.items.get(idx).map(|t| t.id.clone());
-                    app.detail_scroll = 0;
-                    app.mode = AppMode::TrainDetail;
+                    open_detail(&mut app, idx);
                 }
+            }
+            _ => {}
+        },
+        AppMode::Filter => match key.code {
+            KeyCode::Enter => app.mode = AppMode::Normal,
+            KeyCode::Esc => {
+                app.filter.clear();
+                app.resync_selection();
+                app.mode = AppMode::Normal;
+            }
+            KeyCode::Up => app.select_relative(-1),
+            KeyCode::Down => app.select_relative(1),
+            KeyCode::Backspace => {
+                app.filter.pop();
+                app.resync_selection();
+            }
+            KeyCode::Char(c) => {
+                app.filter.push(c);
+                app.resync_selection();
             }
             _ => {}
         },
         AppMode::TrainDetail => match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                 debug!("Closing train detail");
-                app.selected_train_id = None;
                 app.mode = AppMode::Normal;
             }
             KeyCode::Char('l') | KeyCode::Char('L') => toggle_language(&mut app),
-            KeyCode::Up => app.select_relative(-1),
-            KeyCode::Down => app.select_relative(1),
+            KeyCode::Char('?') => app.show_help = true,
+            KeyCode::Up | KeyCode::Char('k') => app.select_relative(-1),
+            KeyCode::Down | KeyCode::Char('j') => app.select_relative(1),
+            KeyCode::Home | KeyCode::Char('g') => app.select_index(0),
+            KeyCode::End | KeyCode::Char('G') => app.select_last(),
             KeyCode::PageUp => {
                 app.detail_scroll = app.detail_scroll.saturating_sub(3);
             }
@@ -273,6 +381,7 @@ async fn handle_key(app: &Arc<Mutex<App>>, reconnect_tx: &mpsc::Sender<()>, key:
                 let before_station = app.station_id.clone();
                 if app.select_station() {
                     debug!("Station changed: {} -> {}", before_station, app.station_id);
+                    persist(&app);
                     drop(app);
                     let _ = reconnect_tx.send(()).await;
                 }
@@ -455,7 +564,131 @@ mod tests {
         h.press(key(KeyCode::Esc)).await;
         let app = h.app.lock().await;
         assert_eq!(app.mode, AppMode::Normal);
-        assert_eq!(app.selected_train_id, None);
+        // Back on the board, the train just viewed stays selected.
+        assert_eq!(app.selected_train_id.as_deref(), Some("t1"));
+    }
+
+    #[tokio::test]
+    async fn vim_keys_home_end_and_paging_move_selection() {
+        let h = Harness::new(25);
+        h.press(ch('j')).await;
+        h.press(ch('j')).await;
+        assert_eq!(h.app.lock().await.selected_train_index, Some(1));
+        h.press(ch('k')).await;
+        assert_eq!(h.app.lock().await.selected_train_index, Some(0));
+        h.press(key(KeyCode::End)).await;
+        assert_eq!(h.app.lock().await.selected_train_index, Some(24));
+        h.press(key(KeyCode::Home)).await;
+        assert_eq!(h.app.lock().await.selected_train_index, Some(0));
+        h.press(ch('G')).await;
+        assert_eq!(h.app.lock().await.selected_train_id.as_deref(), Some("t24"));
+        h.press(ch('g')).await;
+        h.press(key(KeyCode::PageDown)).await;
+        assert_eq!(h.app.lock().await.selected_train_index, Some(10));
+        h.press(key(KeyCode::PageUp)).await;
+        h.press(key(KeyCode::PageUp)).await;
+        assert_eq!(h.app.lock().await.selected_train_index, Some(0));
+
+        // The same movement keys work in the detail view.
+        h.press(key(KeyCode::Enter)).await;
+        h.press(ch('G')).await;
+        h.press(ch('k')).await;
+        let app = h.app.lock().await;
+        assert_eq!(app.mode, AppMode::TrainDetail);
+        assert_eq!(app.selected_train_id.as_deref(), Some("t23"));
+    }
+
+    #[tokio::test]
+    async fn help_opens_from_board_and_detail_and_any_key_closes_it() {
+        let h = Harness::new(2);
+        h.press(ch('?')).await;
+        assert!(h.app.lock().await.show_help);
+        // q closes the help instead of quitting.
+        assert!(!h.press(ch('q')).await);
+        assert!(!h.app.lock().await.show_help);
+
+        h.press(ch('1')).await;
+        h.press(ch('?')).await;
+        h.press(key(KeyCode::Esc)).await;
+        let app = h.app.lock().await;
+        assert!(!app.show_help);
+        assert_eq!(app.mode, AppMode::TrainDetail, "Esc only closed the help");
+    }
+
+    #[tokio::test]
+    async fn filter_narrows_board_and_esc_peels_back() {
+        let mut h = Harness::new(12);
+        h.press(ch('/')).await;
+        assert_eq!(h.app.lock().await.mode, AppMode::Filter);
+        // Command letters and digits are filter text while editing.
+        for c in "T 1".chars() {
+            h.press(ch(c)).await;
+        }
+        {
+            let app = h.app.lock().await;
+            assert_eq!(app.filter, "T 1");
+            let ids: Vec<_> = app.visible_items().iter().map(|t| t.id.clone()).collect();
+            assert_eq!(ids, ["t1", "t10", "t11"]);
+        }
+        h.press(key(KeyCode::Enter)).await;
+        assert_eq!(h.app.lock().await.mode, AppMode::Normal);
+
+        // Digits address the filtered rows.
+        h.press(ch('2')).await;
+        assert_eq!(h.app.lock().await.selected_train_id.as_deref(), Some("t10"));
+        h.press(key(KeyCode::Esc)).await;
+
+        // Esc clears the filter first, keeping the selected train...
+        h.press(key(KeyCode::Esc)).await;
+        {
+            let app = h.app.lock().await;
+            assert!(app.filter.is_empty());
+            assert_eq!(app.selected_train_index, Some(10), "t10 in the full board");
+        }
+        // ...then the selection.
+        h.press(key(KeyCode::Esc)).await;
+        assert_eq!(h.app.lock().await.selected_train_index, None);
+        assert_eq!(h.reconnects(), 0);
+    }
+
+    #[tokio::test]
+    async fn filter_esc_while_editing_clears_and_backspace_edits() {
+        let h = Harness::new(3);
+        h.press(ch('/')).await;
+        h.press(ch('x')).await;
+        h.press(ch('y')).await;
+        h.press(key(KeyCode::Backspace)).await;
+        assert_eq!(h.app.lock().await.filter, "x");
+        h.press(key(KeyCode::Esc)).await;
+        let app = h.app.lock().await;
+        assert!(app.filter.is_empty());
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn selection_drops_when_filter_hides_the_train() {
+        let h = Harness::new(3);
+        h.press(ch('3')).await;
+        h.press(key(KeyCode::Esc)).await;
+        h.press(ch('/')).await;
+        h.press(ch('0')).await;
+        let app = h.app.lock().await;
+        assert_eq!(app.selected_train_index, None);
+        assert_eq!(app.visible_items().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn choosing_a_station_remembers_it_as_recent() {
+        let h = Harness::new(0);
+        h.press(ch('s')).await;
+        for c in "salzburg hbf".chars() {
+            h.press(ch(c)).await;
+        }
+        h.press(key(KeyCode::Enter)).await;
+        let app = h.app.lock().await;
+        assert_eq!(app.station_name, "Salzburg Hbf");
+        assert_eq!(app.recent_stations.first(), Some(&app.station_id));
+        assert_eq!(app.to_config().station.as_ref(), Some(&app.station_id));
     }
 
     #[tokio::test]
@@ -569,13 +802,13 @@ mod tests {
 
     #[test]
     fn no_args_runs() {
-        assert_eq!(args(&[]), Ok(Cli::Run));
+        assert_eq!(args(&[]), Ok(Cli::Run(RunOptions::default())));
     }
 
     #[test]
     fn debug_flag_is_accepted_and_still_runs() {
-        assert_eq!(args(&["--debug"]), Ok(Cli::Run));
-        assert_eq!(args(&["-d"]), Ok(Cli::Run));
+        assert_eq!(args(&["--debug"]), Ok(Cli::Run(RunOptions::default())));
+        assert_eq!(args(&["-d"]), Ok(Cli::Run(RunOptions::default())));
     }
 
     #[test]
@@ -594,6 +827,41 @@ mod tests {
     }
 
     #[test]
+    fn station_and_arrivals_options() {
+        let run = |station: Option<&str>, arrivals| {
+            Ok(Cli::Run(RunOptions {
+                station: station.map(String::from),
+                arrivals,
+            }))
+        };
+        assert_eq!(args(&["--station", "Linz"]), run(Some("Linz"), false));
+        assert_eq!(args(&["-s", "8101001", "-a"]), run(Some("8101001"), true));
+        assert_eq!(args(&["--station=Wien Hbf"]), run(Some("Wien Hbf"), false));
+        assert_eq!(args(&["--arrivals"]), run(None, true));
+        assert!(args(&["--station"]).is_err());
+        assert!(args(&["-s", " "]).is_err());
+        assert!(args(&["--station="]).is_err());
+        assert_eq!(args(&["-s", "Linz", "--help"]), Ok(Cli::Help));
+    }
+
+    #[test]
+    fn initial_app_applies_command_line_overrides() {
+        let app = initial_app(&RunOptions {
+            station: Some("salzburg hbf".into()),
+            arrivals: true,
+        })
+        .unwrap();
+        assert_eq!(app.station_name, "Salzburg Hbf");
+        assert_eq!(app.content_type, ContentType::Arrival);
+
+        let err = initial_app(&RunOptions {
+            station: Some("zzzz-nowhere".into()),
+            arrivals: false,
+        });
+        assert_eq!(err.err().as_deref(), Some("unknown station: zzzz-nowhere"));
+    }
+
+    #[test]
     fn unknown_arguments_are_rejected() {
         assert_eq!(
             args(&["--frobnicate"]),
@@ -604,7 +872,7 @@ mod tests {
 
     #[test]
     fn usage_mentions_every_flag() {
-        for flag in ["--debug", "--version", "--help"] {
+        for flag in ["--station", "--arrivals", "--debug", "--version", "--help"] {
             assert!(USAGE.contains(flag));
         }
     }

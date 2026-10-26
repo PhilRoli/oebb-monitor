@@ -60,11 +60,6 @@ impl Lang {
         Lang::De
     }
 
-    /// Startup language, by precedence: saved config → locale → German.
-    pub fn initial() -> Lang {
-        crate::config::load_language().unwrap_or_else(Lang::detect)
-    }
-
     /// The string table for this language.
     pub fn tr(&self) -> &'static Tr {
         match self {
@@ -193,7 +188,23 @@ pub struct Tr {
     pub hint_stn: &'static str,
     pub hint_ref: &'static str,
     pub hint_lang: &'static str,
+    pub hint_filter: &'static str,
+    pub hint_help: &'static str,
     pub hint_quit: &'static str,
+    // Board filter
+    pub filter_label: &'static str,
+    pub filter_help: &'static str,
+    // Update age, as prefix + amount + suffix ("vor 12 s" / "12 s ago")
+    pub ago_prefix: &'static str,
+    pub ago_suffix: &'static str,
+    // Train detail extras
+    pub track_changed: &'static str,
+    /// Joins train and origin in the arrival detail title ("… von Graz Hbf").
+    pub from_word: &'static str,
+    // Help overlay: (keys, action) rows; an empty key starts a section.
+    pub help_title: &'static str,
+    pub help: &'static [(&'static str, &'static str)],
+    pub help_close: &'static str,
 }
 
 static DE: Tr = Tr {
@@ -243,7 +254,7 @@ static DE: Tr = Tr {
     coach: "Wagen",
     closed: "(geschlossen)",
     details: "Details",
-    detail_help: "↑↓: Züge | PgUp/PgDn: Scrollen | Esc/Q: Schließen",
+    detail_help: "↑↓: Züge | PgUp/PgDn: Scrollen | ?: Hilfe | Esc/Q: Schließen",
     no_train: "Kein Zug ausgewählt",
     detail: "Detail",
     hint_arr: "nk",
@@ -251,7 +262,41 @@ static DE: Tr = Tr {
     hint_stn: "tn",
     hint_ref: "ef",
     hint_lang: "ang",
+    hint_filter: "Filter",
+    hint_help: "Hilfe",
     hint_quit: "uit",
+    filter_label: "Filter",
+    filter_help: "Enter: Übernehmen | Esc: Filter löschen",
+    ago_prefix: "vor ",
+    ago_suffix: "",
+    track_changed: "(Gleiswechsel)",
+    from_word: "von",
+    help_title: "Tastenbelegung",
+    help: &[
+        ("", "Hauptansicht"),
+        ("1–9, 0", "Details zu Zug 1–10"),
+        ("↑↓, j k", "Auswahl bewegen"),
+        ("PgUp/PgDn", "10 Züge weiter"),
+        ("Home/End, g G", "Erster / letzter Zug"),
+        ("Enter", "Details öffnen"),
+        ("/", "Züge filtern (Zug, Linie, Ziel, Halt)"),
+        ("Esc", "Filter, dann Auswahl aufheben"),
+        ("A / D", "Ankünfte / Abfahrten"),
+        ("S", "Station wählen"),
+        ("R", "Neu verbinden"),
+        ("L", "Sprache wechseln"),
+        ("Q", "Beenden"),
+        ("", "Details"),
+        ("↑↓, j k", "Vorheriger / nächster Zug"),
+        ("Home/End, g G", "Erster / letzter Zug"),
+        ("PgUp/PgDn", "Scrollen"),
+        ("Esc / Q", "Schließen"),
+        ("", "Stationssuche"),
+        ("Text", "Nach Name suchen"),
+        ("↑↓", "Treffer wählen"),
+        ("Enter / Esc", "Übernehmen / Abbrechen"),
+    ],
+    help_close: "Beliebige Taste schließt die Hilfe",
 };
 
 static EN: Tr = Tr {
@@ -301,7 +346,7 @@ static EN: Tr = Tr {
     coach: "Coach",
     closed: "(closed)",
     details: "Details",
-    detail_help: "↑↓: Trains | PgUp/PgDn: Scroll | Esc/Q: Close",
+    detail_help: "↑↓: Trains | PgUp/PgDn: Scroll | ?: Help | Esc/Q: Close",
     no_train: "No train selected",
     detail: "Detail",
     hint_arr: "rr",
@@ -309,7 +354,41 @@ static EN: Tr = Tr {
     hint_stn: "tn",
     hint_ref: "ef",
     hint_lang: "ang",
+    hint_filter: "Filter",
+    hint_help: "Help",
     hint_quit: "uit",
+    filter_label: "Filter",
+    filter_help: "Enter: Apply | Esc: Clear filter",
+    ago_prefix: "",
+    ago_suffix: " ago",
+    track_changed: "(track changed)",
+    from_word: "from",
+    help_title: "Keys",
+    help: &[
+        ("", "Main board"),
+        ("1–9, 0", "Details for train 1–10"),
+        ("↑↓, j k", "Move selection"),
+        ("PgUp/PgDn", "Move by 10 trains"),
+        ("Home/End, g G", "First / last train"),
+        ("Enter", "Open details"),
+        ("/", "Filter trains (train, line, destination, stop)"),
+        ("Esc", "Clear filter, then selection"),
+        ("A / D", "Arrivals / departures"),
+        ("S", "Select station"),
+        ("R", "Reconnect"),
+        ("L", "Toggle language"),
+        ("Q", "Quit"),
+        ("", "Details"),
+        ("↑↓, j k", "Previous / next train"),
+        ("Home/End, g G", "First / last train"),
+        ("PgUp/PgDn", "Scroll"),
+        ("Esc / Q", "Close"),
+        ("", "Station search"),
+        ("Text", "Search by name"),
+        ("↑↓", "Pick a result"),
+        ("Enter / Esc", "Select / cancel"),
+    ],
+    help_close: "Press any key to close",
 };
 
 #[cfg(test)]

@@ -194,10 +194,7 @@ async fn run_websocket_with(
                             // Re-sync the selected index from its id after the
                             // sort, so the detail view keeps tracking the right
                             // train as rows shift around.
-                            if let Some(id) = app.selected_train_id.clone() {
-                                app.selected_train_index =
-                                    app.items.iter().position(|i| i.id == id);
-                            }
+                            app.resync_selection();
 
                             if let Some(notices) = params.data.special_notices {
                                 app.special_notices = notices;
