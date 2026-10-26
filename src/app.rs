@@ -6,7 +6,7 @@
 //! unit-tested in isolation.
 
 use chrono::{DateTime, Local};
-use ratatui::widgets::ListState;
+use ratatui::widgets::{ListState, TableState};
 use std::collections::HashMap;
 
 use crate::lang::Lang;
@@ -70,6 +70,8 @@ pub struct App {
     pub max_pages: usize,
     pub selected_train_index: Option<usize>,
     pub selected_train_id: Option<String>,
+    /// Scroll offset of the main board, kept so the selected row stays visible.
+    pub board_state: TableState,
     pub detail_scroll: u16,
     pub lang: Lang,
 }
@@ -97,6 +99,7 @@ impl App {
             max_pages: 5,
             selected_train_index: None,
             selected_train_id: None,
+            board_state: TableState::default(),
             detail_scroll: 0,
             lang: Lang::initial(),
         };

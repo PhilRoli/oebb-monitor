@@ -15,7 +15,7 @@
           "track": "7",
           "sector": "A-C",
           "via": { "default": "St. Pölten Hbf" },
-          "prioritizedVias": ["St. Pölten Hbf", "Linz/Donau Hbf"],
+          "prioritizedVias": ["St. Pölten Hbf~Linz/Donau Hbf"],
           "operator": "ÖBB",
           "remarks": [{ "text": { "default": "Verspätung" } }],
           "unknownFutureField": { "ignored": true },

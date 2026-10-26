@@ -104,6 +104,7 @@ async fn run_websocket_with(
                     app_guard.items.len()
                 );
                 app_guard.items.clear();
+                app_guard.special_notices.clear();
                 app_guard.selected_train_index = None;
                 app_guard.selected_train_id = None;
             }
@@ -789,12 +790,17 @@ mod tests {
         let l = start_loop(base);
         wait_for(&l.app, "departures", |a| a.items.len() == 2).await;
 
+        assert_eq!(l.app.lock().await.special_notices.len(), 1);
+
         l.app.lock().await.content_type = ContentType::Arrival;
         l.reconnect.send(()).await.unwrap();
         wait_for(&l.app, "arrivals", |a| {
             a.items.len() == 1 && a.items[0].id == "a1"
         })
         .await;
+        // The arrival board carries no notices, so none may linger from the
+        // departure board.
+        assert!(l.app.lock().await.special_notices.is_empty());
     }
 
     #[tokio::test]

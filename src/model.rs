@@ -28,10 +28,44 @@ pub struct TrainItem {
     pub sector: Option<String>,
     pub remarks: Option<Vec<Remark>>,
     pub via: Option<Destination>,
+    /// Major stops. The feed sends them as a single `~`-joined entry; use
+    /// [`TrainItem::major_stops`] for the individual names.
     #[serde(rename = "prioritizedVias")]
     pub prioritized_vias: Option<Vec<String>>,
     pub operator: Option<String>,
     pub formation: Option<Vec<Formation>>,
+}
+
+impl TrainItem {
+    /// The major stops in route order, split out of the feed's `~`-joined
+    /// entry.
+    pub fn major_stops(&self) -> Vec<&str> {
+        self.prioritized_vias
+            .iter()
+            .flatten()
+            .flat_map(|entry| entry.split('~'))
+            .map(str::trim)
+            .filter(|stop| !stop.is_empty())
+            .collect()
+    }
+
+    /// Every intermediate stop in route order, parsed from the feed's `via`
+    /// text: `über Linz Hbf~&#8203;St.Pölten Hbf~…`. The leading "über" (via)
+    /// is dropped, as the UI labels the list itself in either language.
+    pub fn all_stops(&self) -> Vec<String> {
+        let Some(via) = &self.via else {
+            return Vec::new();
+        };
+        let via = via.default.trim_start();
+        let via = via
+            .strip_prefix("über")
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+            .unwrap_or(via);
+        via.split('~')
+            .map(|stop| stop.replace("&#8203;", "").trim().to_string())
+            .filter(|stop| !stop.is_empty())
+            .collect()
+    }
 }
 
 /// One wagon (or the locomotive) in a train's physical composition, including
@@ -125,7 +159,7 @@ mod tests {
         assert_eq!(t.line.as_deref(), Some("RJX"));
         assert_eq!(t.destination.as_ref().unwrap().default, "Salzburg Hbf");
         assert_eq!(t.track.as_deref(), Some("7"));
-        assert_eq!(t.prioritized_vias.as_ref().unwrap().len(), 2);
+        assert_eq!(t.major_stops(), ["St. Pölten Hbf", "Linz/Donau Hbf"]);
         assert_eq!(t.remarks.as_ref().unwrap()[0].text.default, "Verspätung");
 
         let formation = t.formation.as_ref().unwrap();
@@ -209,6 +243,47 @@ mod tests {
         let bad = r#"{"method":"update","params":{"data":{"departures":[{"train":"X"}]}}}"#;
         let msg: WsMessage = serde_json::from_str(bad).unwrap();
         assert!(matches!(msg.into_update(), Some(Err(_))));
+    }
+
+    #[test]
+    fn major_stops_split_the_tilde_joined_entry() {
+        // The live feed sends all major stops as one `~`-joined entry.
+        let item = |vias: Option<Vec<&str>>| TrainItem {
+            prioritized_vias: vias.map(|v| v.into_iter().map(String::from).collect()),
+            ..Default::default()
+        };
+        assert_eq!(
+            item(Some(vec!["Linz Hbf~St.Pölten Hbf~Wien Hbf"])).major_stops(),
+            ["Linz Hbf", "St.Pölten Hbf", "Wien Hbf"]
+        );
+        // Separate entries, stray separators and padding are handled too.
+        assert_eq!(
+            item(Some(vec!["Wels Hbf ", "~Linz Hbf~", ""])).major_stops(),
+            ["Wels Hbf", "Linz Hbf"]
+        );
+        assert!(item(Some(vec![])).major_stops().is_empty());
+        assert!(item(None).major_stops().is_empty());
+    }
+
+    #[test]
+    fn all_stops_drop_the_uber_prefix_and_zero_width_spaces() {
+        let item = |via: &str| TrainItem {
+            via: Some(Destination {
+                default: via.to_string(),
+            }),
+            ..Default::default()
+        };
+        // Verbatim shape from the live feed, non-breaking spaces included.
+        assert_eq!(
+            item("über Linz\u{a0}Hbf~&#8203;St.Pölten\u{a0}Hbf~&#8203;Wien\u{a0}Meidling")
+                .all_stops(),
+            ["Linz\u{a0}Hbf", "St.Pölten\u{a0}Hbf", "Wien\u{a0}Meidling"]
+        );
+        assert_eq!(item("über\u{a0}Wels Hbf").all_stops(), ["Wels Hbf"]);
+        // Only the word "über" is a prefix, not a name that starts like it.
+        assert_eq!(item("überall~Graz").all_stops(), ["überall", "Graz"]);
+        assert!(item("über ").all_stops().is_empty());
+        assert!(TrainItem::default().all_stops().is_empty());
     }
 
     #[test]

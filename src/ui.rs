@@ -2,7 +2,8 @@
 //!
 //! [`ui`] dispatches to one of three screen renderers based on the current
 //! [`AppMode`]. Rendering is a pure function of [`App`] state; nothing here
-//! mutates application data beyond the list widget's own scroll/selection.
+//! mutates application data beyond scroll state (the board, station list, and
+//! detail view offsets).
 //! All user-facing text comes from the active language's [`crate::lang::Tr`].
 
 use ratatui::{
@@ -221,7 +222,13 @@ fn render_main(f: &mut Frame, app: &mut App) {
             .title(tr.block_trains),
     );
 
-    f.render_widget(table, chunks[1]);
+    // The table scrolls to keep the selection visible; with no selection it
+    // returns to the top rather than staying wherever it last scrolled to.
+    app.board_state.select(app.selected_train_index);
+    if app.selected_train_index.is_none() {
+        *app.board_state.offset_mut() = 0;
+    }
+    f.render_stateful_widget(table, chunks[1], &mut app.board_state);
 
     // Ratatui's Paragraph wraps for us (correctly accounting for character
     // width), so we just emit one bullet line per notice and let it flow.
@@ -512,34 +519,25 @@ fn render_train_detail(f: &mut Frame, app: &mut App) {
 
         // Prioritized stops render independently of the full via list, so they
         // still show when the detailed via string is missing.
-        if let Some(prioritized) = &train.prioritized_vias {
-            if !prioritized.is_empty() {
-                content_lines.push(Line::from(Span::styled(
-                    format!("{}: {}", tr.major_stops, prioritized.join(" ~ ")),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )));
-            }
+        let major_stops = train.major_stops();
+        if !major_stops.is_empty() {
+            content_lines.push(Line::from(Span::styled(
+                format!("{}: {}", tr.major_stops, major_stops.join(" → ")),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
         }
 
-        if let Some(via) = &train.via {
-            let stops: Vec<String> = via
-                .default
-                .split('~')
-                .map(|s| s.replace("&#8203;", "").trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-
-            if !stops.is_empty() {
-                content_lines.push(Line::from(Span::styled(
-                    format!("{}:", tr.all_stops),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                content_lines.push(Line::from(format!("  {}", stops.join(" → "))));
-            }
+        let stops = train.all_stops();
+        if !stops.is_empty() {
+            content_lines.push(Line::from(Span::styled(
+                format!("{}:", tr.all_stops),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            content_lines.push(Line::from(format!("  {}", stops.join(" → "))));
         }
 
         content_lines.push(Line::from(""));
@@ -639,10 +637,20 @@ fn render_train_detail(f: &mut Frame, app: &mut App) {
             }
         }
 
-        let content = Paragraph::new(content_lines)
-            .block(Block::default().borders(Borders::ALL).title(tr.details))
-            .wrap(Wrap { trim: true })
-            .scroll((app.detail_scroll, 0));
+        let content_block = Block::default().borders(Borders::ALL).title(tr.details);
+        let inner = content_block.inner(chunks[1]);
+        let content = Paragraph::new(content_lines).wrap(Wrap { trim: true });
+
+        // Clamp the scroll so the last line can't leave the bottom edge, and
+        // so scrolling back up responds immediately after overshooting.
+        let max_scroll = content
+            .line_count(inner.width)
+            .saturating_sub(inner.height as usize);
+        app.detail_scroll = app
+            .detail_scroll
+            .min(max_scroll.try_into().unwrap_or(u16::MAX));
+
+        let content = content.block(content_block).scroll((app.detail_scroll, 0));
         f.render_widget(content, chunks[1]);
 
         let help = Paragraph::new(tr.detail_help)
@@ -808,6 +816,10 @@ mod tests {
         assert!(out.contains("ÖBB"), "operator");
         assert!(out.contains("Verspätung"), "remark");
         assert!(out.contains("1st class"), "decoded wagon class");
+        assert!(
+            out.contains("Major stops: St. Pölten Hbf → Linz/Donau Hbf"),
+            "major stops split out of the feed's joined entry"
+        );
         assert!(out.contains(app.lang.tr().detail_help));
     }
 
@@ -842,7 +854,11 @@ mod tests {
         app.mode = AppMode::TrainDetail;
         app.selected_train_index = Some(0);
         app.detail_scroll = u16::MAX;
-        render(&mut app, 120, 40);
+        let out = render(&mut app, 120, 40);
+        // Clamped so the end of the content stays on screen, and scrolling
+        // back up takes effect immediately.
+        assert!(app.detail_scroll < 10, "{}", app.detail_scroll);
+        assert!(out.contains("1st class"), "{out}");
     }
 
     #[test]
@@ -903,7 +919,13 @@ mod tests {
             .collect();
         app.selected_train_index = Some(150);
         let out = render(&mut app, 140, 30);
-        assert!(out.contains("Zug"));
+        assert!(out.contains("Zug 150"), "selected row scrolled into view");
+        assert!(!out.contains("Zug 0 "), "top rows scrolled away");
+
+        // Without a selection the board starts from the top again.
+        app.selected_train_index = None;
+        let out = render(&mut app, 140, 30);
+        assert!(out.contains("Zug 0 "));
     }
 
     #[test]
