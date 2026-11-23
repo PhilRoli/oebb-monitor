@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::Local;
+
 use futures_util::{SinkExt, StreamExt};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -199,7 +199,7 @@ async fn run_websocket_with(
                             if let Some(notices) = params.data.special_notices {
                                 app.special_notices = notices;
                             }
-                            app.last_update = Some(Local::now());
+                            app.last_update = Some(jiff::Timestamp::now());
                             app.last_error = None;
                             app.connection = ConnectionState::Connected;
                             notify.notify_one();

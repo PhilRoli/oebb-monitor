@@ -5,7 +5,7 @@
 //! helpers ([`format_time`], [`calculate_delay`], [`build_ws_url`]) that are
 //! unit-tested in isolation.
 
-use chrono::{DateTime, Local};
+use jiff::{tz::TimeZone, Timestamp};
 use ratatui::widgets::{ListState, TableState};
 use std::collections::HashMap;
 
@@ -64,7 +64,7 @@ pub struct App {
     pub station_name: String,
     pub items: Vec<TrainItem>,
     pub special_notices: Vec<SpecialNotice>,
-    pub last_update: Option<DateTime<Local>>,
+    pub last_update: Option<Timestamp>,
     pub connection: ConnectionState,
     /// Most recent connection problem; cleared by the next good update.
     pub last_error: Option<LinkError>,
@@ -453,11 +453,12 @@ fn encode_query_value(value: &str) -> String {
 
 /// Format an RFC 3339 timestamp as local `HH:MM`, or `"-"` if unparseable.
 pub fn format_time(iso_time: &str) -> String {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(iso_time) {
-        let local: DateTime<Local> = dt.into();
-        local.format("%H:%M").to_string()
-    } else {
-        "-".to_string()
+    match iso_time.parse::<Timestamp>() {
+        Ok(ts) => ts
+            .to_zoned_datetime(TimeZone::system())
+            .strftime("%H:%M")
+            .to_string(),
+        Err(_) => "-".to_string(),
     }
 }
 
@@ -466,9 +467,9 @@ pub fn format_time(iso_time: &str) -> String {
 /// train is exactly on time.
 pub fn calculate_delay(item: &TrainItem) -> Option<i64> {
     let expected = item.expected.as_ref()?;
-    let scheduled = DateTime::parse_from_rfc3339(&item.scheduled).ok()?;
-    let exp = DateTime::parse_from_rfc3339(expected).ok()?;
-    let delay = (exp - scheduled).num_minutes();
+    let scheduled = item.scheduled.parse::<Timestamp>().ok()?;
+    let exp = expected.parse::<Timestamp>().ok()?;
+    let delay = exp.duration_since(scheduled).as_secs() / 60;
     (delay != 0).then_some(delay)
 }
 
@@ -710,11 +711,11 @@ mod tests {
 
     #[test]
     fn format_time_is_hh_mm_in_local_time() {
-        use chrono::Timelike;
         let formatted = format_time("2024-06-01T12:34:56+00:00");
-        let local: DateTime<Local> = DateTime::parse_from_rfc3339("2024-06-01T12:34:56+00:00")
+        let local = "2024-06-01T12:34:56+00:00"
+            .parse::<Timestamp>()
             .unwrap()
-            .into();
+            .to_zoned_datetime(TimeZone::system());
         assert_eq!(
             formatted,
             format!("{:02}:{:02}", local.hour(), local.minute())

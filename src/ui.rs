@@ -6,7 +6,6 @@
 //! detail view offsets).
 //! All user-facing text comes from the active language's [`crate::lang::Tr`].
 
-use chrono::Local;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -19,6 +18,7 @@ use crate::app::{
     calculate_delay, format_time, App, AppMode, ConnectionState, ContentType, LinkError,
 };
 use crate::lang::Tr;
+use jiff::{tz::TimeZone, Timestamp};
 
 /// Map a delay (minutes) to its colour: green on time, yellow up to 5 min late,
 /// red beyond that.
@@ -270,7 +270,10 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
     );
 
     // Only where it can't collide with the centred title.
-    let clock = Local::now().format("%H:%M").to_string();
+    let clock = Timestamp::now()
+        .to_zoned_datetime(TimeZone::system())
+        .strftime("%H:%M")
+        .to_string();
     let clock_width = clock.len() as u16 + 1;
     if inner.width >= title_width + 2 * clock_width {
         f.render_widget(
@@ -431,7 +434,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
     let (update_text, update_color) = match &app.connection {
         ConnectionState::Connected => match app.last_update {
             Some(t) => {
-                let secs = (Local::now() - t).num_seconds();
+                let secs = Timestamp::now().duration_since(t).as_secs();
                 (format_age(tr, secs), age_color(secs))
             }
             None => (tr.connected.to_string(), Color::Green),
@@ -959,6 +962,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    use jiff::SignedDuration;
 
     use super::*;
 
@@ -1058,7 +1062,7 @@ mod tests {
         app.last_update = None;
         assert!(render(&mut app, 140, 40).contains(tr.connected));
 
-        app.last_update = Some(chrono::Local::now());
+        app.last_update = Some(Timestamp::now());
         let out = render(&mut app, 140, 40);
         assert!(out.contains(tr.last_update));
         assert!(!out.contains(tr.connecting));
@@ -1330,10 +1334,14 @@ mod tests {
     #[test]
     fn title_shows_the_clock_when_there_is_room() {
         let mut app = loaded_app();
-        let clock = Local::now().format("%H:%M").to_string();
+        let clock = Timestamp::now()
+            .to_zoned_datetime(TimeZone::system())
+            .strftime("%H:%M")
+            .to_string();
         // The minute may tick over mid-test; accept the next one too.
-        let next = (Local::now() + chrono::Duration::minutes(1))
-            .format("%H:%M")
+        let next = (Timestamp::now() + SignedDuration::from_mins(1))
+            .to_zoned_datetime(TimeZone::system())
+            .strftime("%H:%M")
             .to_string();
         let out = render(&mut app, 140, 40);
         assert!(out.contains(&clock) || out.contains(&next));
@@ -1350,7 +1358,7 @@ mod tests {
         assert_eq!(age_color(2 * STALE_AFTER_SECS + 1), Color::Red);
 
         let mut app = loaded_app();
-        app.last_update = Some(Local::now() - chrono::Duration::seconds(5));
+        app.last_update = Some(Timestamp::now() - SignedDuration::from_secs(5));
         assert!(render(&mut app, 140, 40).contains("s ago"));
     }
 

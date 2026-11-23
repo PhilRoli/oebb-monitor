@@ -5,7 +5,7 @@
 //! `~/.local/state/...`, falling back to the OS temp dir). Without the flag the
 //! macro compiles to a cheap no-op call that returns early.
 
-use chrono::Local;
+use jiff::{tz::TimeZone, Timestamp};
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
@@ -68,7 +68,9 @@ impl DebugLogger {
         }
         if let Some(ref file) = self.file {
             if let Ok(mut f) = file.lock() {
-                let timestamp = Local::now().format("%H:%M:%S%.3f");
+                let timestamp = Timestamp::now()
+                    .to_zoned_datetime(TimeZone::system())
+                    .strftime("%H:%M:%S%.3f");
                 let _ = writeln!(f, "[{}] {}", timestamp, msg);
                 let _ = f.flush();
             }
